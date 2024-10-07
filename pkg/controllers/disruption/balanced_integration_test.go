@@ -695,6 +695,12 @@ var _ = Describe("Balanced Consolidation", func() {
 
 	Context("Mixed-Policy NodePools", func() {
 		It("should apply scoring to Balanced pools while non-Balanced pools consolidate normally", func() {
+			// Indeed fork divergence: the Multi-Node Consolidation Partitioning patch partitions
+			// multi-node consolidation by NodePool + CPU architecture, so a single reconcile cannot
+			// consolidate nodes across two different NodePools, and the balanced "k: 2" scoring event
+			// cannot fire when a Balanced pool holds a single node. This upstream expectation is
+			// incompatible with our partitioning behavior. See the "Karpenter Patches" wiki.
+			Skip("incompatible with Indeed multi-node consolidation partitioning patch")
 			balancedPool := test.NodePool(v1.NodePool{
 				Spec: v1.NodePoolSpec{
 					Disruption: v1.Disruption{
