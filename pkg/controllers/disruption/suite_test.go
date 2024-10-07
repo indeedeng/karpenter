@@ -19,6 +19,7 @@ package disruption_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -125,6 +126,7 @@ var _ = BeforeEach(func() {
 	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController)
 
 	// Ensure that we reset the disruption controller's methods after each test run
+	os.Setenv("INDEED_ENABLE_SINGLE_NODE_CONSOLIDATION", "true")
 	disruptionController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
 	env.Clock.SetTime(time.Now())
 	cluster.Reset()
