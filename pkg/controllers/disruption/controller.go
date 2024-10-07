@@ -21,6 +21,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -108,7 +109,7 @@ func NewMethods(ctx context.Context, clk clock.Clock, cluster *state.Cluster, ku
 	if options.FromContext(ctx).FeatureGates.NodeRepair && !options.FromContext(ctx).LegacyNodeRepair {
 		methods = append(methods, NewRepair(c))
 	}
-	return append(methods, []Method{
+	methods = append(methods, []Method{
 		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
 		NewEmptiness(c),
 		// Terminate and create replacement for drifted NodeClaims in Static NodePool
@@ -118,8 +119,16 @@ func NewMethods(ctx context.Context, clk clock.Clock, cluster *state.Cluster, ku
 		// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
 		NewMultiNodeConsolidation(c),
 		// And finally fall back our single NodeClaim consolidation to further reduce cluster cost.
-		NewSingleNodeConsolidation(c),
+		//NewSingleNodeConsolidation(c),
 	}...)
+	if os.Getenv("INDEED_ENABLE_SINGLE_NODE_CONSOLIDATION") == "true" {
+		fmt.Printf("enabling single node consolidation\n")
+		methods = append(methods, NewSingleNodeConsolidation(c))
+	} else {
+		fmt.Printf("single node consolidation is disabled\n")
+	}
+	fmt.Printf("multi node consolidation timeout duration: %s\n", MultiNodeConsolidationTimeoutDuration)
+	return methods
 }
 
 func (c *Controller) Name() string {
