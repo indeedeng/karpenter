@@ -144,6 +144,25 @@ func computeRescheduleDisruptionCost(ctx context.Context, reschedulablePods []*c
 // SavingsRatio returns cost per unit disruption (higher = prefer to disrupt).
 func (c *Candidate) SavingsRatio() float64 { return c.Price / c.RescheduleDisruptionCost }
 
+// disruptionSortRatio is the SavingsRatio scaled by the node's utilization so
+// that, given an equal savings ratio, less-utilized nodes sort ahead of
+// more-utilized nodes (they are cheaper to disrupt). Upstream's cost-model
+// refactor moved candidate ordering onto the savings ratio, so this is where
+// the Indeed "scale disruption cost by node utilization" patch now applies.
+// When utilization is unavailable (0), fall back to the unscaled savings ratio
+// so ordering degrades gracefully to upstream behavior.
+func (c *Candidate) disruptionSortRatio() float64 {
+	ratio := c.SavingsRatio()
+	utilization := c.Utilization()
+	// Fall back to the unscaled ratio when utilization is unavailable or
+	// degenerate (e.g. a node whose allocatable is missing a requested
+	// resource yields a non-finite value), so ordering matches upstream.
+	if utilization <= 0 || math.IsInf(utilization, 0) || math.IsNaN(utilization) {
+		return ratio
+	}
+	return ratio / utilization
+}
+
 func (c *Candidate) OwnedByStaticNodePool() bool {
 	return c.NodePool.Spec.Replicas != nil
 }
