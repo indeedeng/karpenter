@@ -136,20 +136,31 @@ func (c *consolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
 	return cn.NodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()
 }
 
-// sortCandidates sorts candidates by price/disruption ratio descending.
-// The binary search in multi-node consolidation tries the first N candidates
-// as a batch. Ratio sort means the batch contains the highest-value nodes,
-// so budget-limited cycles execute the most impactful moves first.
+// sortCandidates orders candidates per consolidation policy. Multi-node
+// consolidation binary-searches prefixes of at most 100 candidates per
+// partition, so this order decides which nodes are ever tried together.
 //
-// This changes multi-node behavior for WhenEmptyOrUnderutilized, which
-// previously sorted by disruption cost ascending. The old sort found batches
-// that were easy to pack (low-disruption nodes fit together). The new sort
-// finds batches worth packing (high savings per unit disruption). The binary
-// search still converges because it shrinks the window until scheduling
-// succeeds.
+// WhenEmpty and WhenEmptyOrUnderutilized pools sort by DisruptionCost ascending
+// so the least-loaded nodes come first; they are the easiest to pack together.
+// Sorting these pools by savings ratio fills the multi-node window with large,
+// tightly packed nodes that rarely consolidate.
+//
+// Balanced pools sort by savings ratio descending, which is what their
+// per-move scoring is built around.
+//
+// Every caller handles candidates per NodePool, so order across policies only
+// has to be consistent; Balanced candidates sort first.
 func (c *consolidation) sortCandidates(_ context.Context, candidates []*Candidate) []*Candidate {
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].SavingsRatio() > candidates[j].SavingsRatio()
+		iBalanced := candidates[i].NodePool.Spec.Disruption.ConsolidationPolicy.IsBalanced()
+		jBalanced := candidates[j].NodePool.Spec.Disruption.ConsolidationPolicy.IsBalanced()
+		if iBalanced != jBalanced {
+			return iBalanced
+		}
+		if iBalanced {
+			return candidates[i].disruptionSortRatio() > candidates[j].disruptionSortRatio()
+		}
+		return candidates[i].DisruptionCost < candidates[j].DisruptionCost
 	})
 	return candidates
 }

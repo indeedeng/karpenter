@@ -134,6 +134,37 @@ func (c *Candidate) SavingsRatio() float64 {
 	return disruptionutils.SavingsRatio(c.Price, c.RescheduleDisruptionCost)
 }
 
+// disruptionSortRatio is the SavingsRatio scaled by the node's utilization so
+// that, given an equal savings ratio, less-utilized nodes sort ahead of
+// more-utilized nodes (they are cheaper to disrupt). Upstream's cost-model
+// refactor moved candidate ordering onto the savings ratio, so this is where
+// the Indeed "scale disruption cost by node utilization" patch now applies.
+// When utilization is unavailable (0), fall back to the unscaled savings ratio
+// so ordering degrades gracefully to upstream behavior.
+func (c *Candidate) disruptionSortRatio() float64 {
+	ratio := c.SavingsRatio()
+	utilization := c.Utilization()
+	// Fall back to the unscaled ratio when utilization is unavailable or
+	// degenerate (e.g. a node whose allocatable is missing a requested
+	// resource yields a non-finite value), so ordering matches upstream.
+	if utilization <= 0 || math.IsInf(utilization, 0) || math.IsNaN(utilization) {
+		return ratio
+	}
+	return ratio / utilization
+}
+
+// utilizationWeight scales DisruptionCost so that less-utilized nodes sort ahead
+// of busier nodes with similar pods. A requested resource missing from
+// allocatable makes utilization non-finite; NaN would break the sort's
+// ordering, so those nodes are left unscaled.
+func utilizationWeight(node *state.StateNode) float64 {
+	utilization := node.Utilization()
+	if math.IsInf(utilization, 0) || math.IsNaN(utilization) {
+		return 1
+	}
+	return utilization
+}
+
 func (c *Candidate) OwnedByStaticNodePool() bool {
 	return c.NodePool.Spec.Replicas != nil
 }
@@ -219,7 +250,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		reschedulablePods: reschedulable,
 		hasPodBlockers:    hasPodBlockers,
 		// We get the disruption cost from all pods in the candidate, not just the reschedulable pods
-		DisruptionCost:           disruptionutils.ReschedulingCost(ctx, pods) * disruptionutils.LifetimeRemaining(clk, nodePool, node.NodeClaim),
+		DisruptionCost:           disruptionutils.ReschedulingCost(ctx, pods) * disruptionutils.LifetimeRemaining(clk, nodePool, node.NodeClaim) * utilizationWeight(node),
 		Price:                    disruptionutils.ResolveOfferingPrice(node.Labels(), instanceType),
 		RescheduleDisruptionCost: disruptionutils.ComputeRescheduleDisruptionCost(ctx, reschedulable),
 	}, nil
