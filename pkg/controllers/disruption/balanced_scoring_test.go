@@ -595,46 +595,44 @@ var _ = Describe("Balanced Scoring", func() {
 			Expect(sorted[2]).To(Equal(candB), "expected third candidate to be B (lowest ratio)")
 		})
 
-		It("should sort non-Balanced candidates by savings ratio descending", func() {
-			np := makeNodePool("default", v1.ConsolidationPolicyWhenEmptyOrUnderutilized)
+		DescribeTable("should sort non-Balanced candidates by disruption cost ascending, ignoring savings ratio",
+			func(policy v1.ConsolidationPolicy) {
+				np := makeNodePool("default", policy)
 
-			// All same price, different disruption costs -> ratio = price/disruption
-			itA := makeInstanceType("type-a", 4.84)
-			itB := makeInstanceType("type-b", 4.84)
-			itC := makeInstanceType("type-c", 4.84)
+				// Savings ratio order would be B > C > A; disruption cost order is A < C < B.
+				candA := makeCandidate("node-a", np, makeInstanceType("cheap", 1.0), []*corev1.Pod{makePod("pa", "")})
+				candA.DisruptionCost = 0.1
+				candB := makeCandidate("node-b", np, makeInstanceType("expensive", 10.0), []*corev1.Pod{makePod("pb", "")})
+				candB.DisruptionCost = 5.0
+				candC := makeCandidate("node-c", np, makeInstanceType("medium", 5.0), []*corev1.Pod{makePod("pc", "")})
+				candC.DisruptionCost = 1.0
 
-			candA := makeCandidate("node-a", np, itA, []*corev1.Pod{makePod("pa", "")})
-			candA.RescheduleDisruptionCost = 10.0 // ratio = 4.84/10 = 0.484
-			candB := makeCandidate("node-b", np, itB, nil)
-			// no pods: RescheduleDisruptionCost = 1.0 (base), ratio = 4.84/1 = 4.84
-			candC := makeCandidate("node-c", np, itC, []*corev1.Pod{makePod("pc", "")})
-			candC.RescheduleDisruptionCost = 5.0 // ratio = 4.84/5 = 0.968
+				c := consolidation{}
+				ctx := options.ToContext(context.Background(), &options.Options{})
+				sorted := c.sortCandidates(ctx, []*Candidate{candB, candC, candA})
 
-			c := consolidation{}
-			ctx := options.ToContext(context.Background(), &options.Options{})
-			sorted := c.sortCandidates(ctx, []*Candidate{candA, candB, candC})
+				Expect(sorted).To(Equal([]*Candidate{candA, candC, candB}))
+			},
+			Entry("WhenEmptyOrUnderutilized", v1.ConsolidationPolicyWhenEmptyOrUnderutilized),
+			Entry("WhenEmpty", v1.ConsolidationPolicyWhenEmpty),
+		)
 
-			// Expected order by ratio descending: B (4.84) > C (0.968) > A (0.484)
-			Expect(sorted[0]).To(Equal(candB))
-			Expect(sorted[1]).To(Equal(candC))
-			Expect(sorted[2]).To(Equal(candA))
-		})
-
-		It("should sort all candidates by savings ratio when any uses Balanced", func() {
+		It("should keep each policy's order when Balanced and non-Balanced candidates are mixed", func() {
 			balancedNP := makeNodePool("balanced", v1.ConsolidationPolicyBalanced)
 			defaultNP := makeNodePool("default", v1.ConsolidationPolicyWhenEmptyOrUnderutilized)
 
-			itExpensive := makeInstanceType("expensive", 10.0)
-			itCheap := makeInstanceType("cheap", 1.0)
-
-			candBalanced := makeCandidate("node-balanced", balancedNP, itExpensive, []*corev1.Pod{makePod("p1", "")})
-			candDefault := makeCandidate("node-default", defaultNP, itCheap, []*corev1.Pod{makePod("p2", "")})
+			balancedLow := makeCandidate("balanced-low", balancedNP, makeInstanceType("cheap", 1.0), []*corev1.Pod{makePod("bl", "")})
+			balancedHigh := makeCandidate("balanced-high", balancedNP, makeInstanceType("expensive", 10.0), []*corev1.Pod{makePod("bh", "")})
+			defaultBusy := makeCandidate("default-busy", defaultNP, makeInstanceType("cheap", 1.0), []*corev1.Pod{makePod("db", "")})
+			defaultBusy.DisruptionCost = 5.0
+			defaultIdle := makeCandidate("default-idle", defaultNP, makeInstanceType("expensive", 10.0), []*corev1.Pod{makePod("di", "")})
+			defaultIdle.DisruptionCost = 0.1
 
 			c := consolidation{}
 			ctx := options.ToContext(context.Background(), &options.Options{})
-			sorted := c.sortCandidates(ctx, []*Candidate{candDefault, candBalanced})
+			sorted := c.sortCandidates(ctx, []*Candidate{defaultBusy, balancedLow, defaultIdle, balancedHigh})
 
-			Expect(sorted[0]).To(Equal(candBalanced), "expected balanced candidate first (higher ratio)")
+			Expect(sorted).To(Equal([]*Candidate{balancedHigh, balancedLow, defaultIdle, defaultBusy}))
 		})
 	})
 
