@@ -286,7 +286,8 @@ type Command struct {
 	// staged first; Decision() surfaces it as TerminateFirstDecision.
 	TerminateFirstReason TerminateFirstReason
 	// Reboot is already handed off to its controller, so the queue only records the decision.
-	Reboot bool
+	Reboot  bool
+	Message string
 }
 
 // Reason returns the disruption reason for this command.
