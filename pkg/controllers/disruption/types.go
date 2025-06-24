@@ -160,6 +160,7 @@ type Command struct {
 	Results      scheduling.Results
 	Candidates   []*Candidate
 	Replacements []*Replacement
+	Message      string
 }
 
 type Decision string
