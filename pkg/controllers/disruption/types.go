@@ -255,6 +255,7 @@ type Command struct {
 	Candidates          []*Candidate
 	Replacements        []*Replacement
 	PoolDisruptionCosts map[string]float64
+	Message             string
 }
 
 // Reason returns the disruption reason for this command.
