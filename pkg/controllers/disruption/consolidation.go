@@ -186,6 +186,7 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 			Candidates:          candidates,
 			Results:             results,
 			PoolDisruptionCosts: computePoolDisruptionCosts(candidates),
+			Message:             consolidationMessage(candidates, results, 0.0),
 		}, nil
 	}
 
@@ -254,6 +255,7 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 		Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
 		Results:             results,
 		PoolDisruptionCosts: computePoolDisruptionCosts(candidates),
+		Message:             consolidationMessage(candidates, results, candidatePrice),
 	}
 	cmd.EmitCandidateEvents(c.recorder)
 
@@ -304,6 +306,7 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 			Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
 			Results:             results,
 			PoolDisruptionCosts: computePoolDisruptionCosts(candidates),
+			Message:             consolidationMessage(candidates, results, candidatePrice),
 		}
 		cmd.EmitCandidateEvents(c.recorder)
 
@@ -343,6 +346,7 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 		Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
 		Results:             results,
 		PoolDisruptionCosts: computePoolDisruptionCosts(candidates),
+		Message:             consolidationMessage(candidates, results, candidatePrice),
 	}
 	cmd.EmitCandidateEvents(c.recorder)
 
