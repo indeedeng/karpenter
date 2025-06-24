@@ -44,6 +44,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -227,10 +228,18 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		if err := c.queue.StartCommand(ctx, &cmd); err != nil {
 			errs[i] = fmt.Errorf("disrupting candidates, %w", err)
 		}
+		// emit event for the consolidation
+		log.FromContext(ctx).Info(fmt.Sprintf("Disrupting %d candidates with message: %s", len(cmd.Candidates), cmd.Message))
+		if cmd.Message != "" {
+			for _, candidate := range cmd.Candidates {
+				c.recorder.Publish(disruptionevents.ConsolidationInfo(candidate.Node, candidate.NodeClaim, cmd.Message)...)
+			}
+		}
 	})
 	if err = multierr.Combine(errs...); err != nil {
 		return false, fmt.Errorf("disrupting candidates, %w", err)
 	}
+
 	return true, nil
 }
 
