@@ -321,6 +321,12 @@ var _ = Describe("Drift", func() {
 			ExpectMetricCounterValue(disruption.DecisionsPerformedTotal, 10, map[string]string{
 				metrics.ReasonLabel: "drifted",
 			})
+			for _, np := range nps {
+				ExpectMetricCounterValue(disruption.NodepoolDecisionsPerformed, 1, map[string]string{
+					metrics.NodePoolLabel: np.Name,
+					metrics.ReasonLabel:   "drifted",
+				})
+			}
 		})
 	})
 	Context("Drift", func() {
