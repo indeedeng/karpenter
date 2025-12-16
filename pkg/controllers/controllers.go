@@ -174,6 +174,10 @@ func NewControllers(
 				status.WithHistogramBuckets(prometheus.ExponentialBuckets(0.5, 2, 15)), // 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192
 				status.WithLabels(append(lo.Map(cloudProvider.GetSupportedNodeClasses(), func(obj status.Object, _ int) string { return v1.NodeClassLabelKey(object.GVK(obj).GroupKind()) }), v1.NodePoolLabelKey, v1.NodeInitializedLabelKey)...)),
 		)
+	} else {
+		controllers = append(controllers,
+			metricsnodepool.NewController(kubeClient, cloudProvider, clusterCost),
+		)
 	}
 
 	// The reboot controller only acts on NodeClaims with a committed reboot, so it always runs: a reboot already in flight
