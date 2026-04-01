@@ -334,6 +334,11 @@ func (cc *ClusterCost) internalRemoveOffering(npName string, offeringKey Offerin
 
 	oc, exists := npc.offeringCounts[offeringKey]
 	if !exists {
+		trackedOfferings := make([]string, 0, len(npc.offeringCounts))
+		for k, v := range npc.offeringCounts {
+			trackedOfferings = append(trackedOfferings, fmt.Sprintf("{instance=%q zone=%q capacity=%q count=%d price=%f}", k.InstanceName, k.Zone, k.CapacityType, v.Count, v.Price))
+		}
+		log.Log.Info("offering tracking state at removal failure", "nodepool", npName, "trackedOfferings", trackedOfferings)
 		return fmt.Errorf("attempted to remove nonexistent offering from nodepool %q (instance, %q, zone, %q, capacity, %q)", npName, offeringKey.InstanceName, offeringKey.Zone, offeringKey.CapacityType)
 	}
 
@@ -341,6 +346,7 @@ func (cc *ClusterCost) internalRemoveOffering(npName string, offeringKey Offerin
 	npc.offeringCounts[offeringKey] = oc
 	npc.cost -= oc.Price
 	if oc.Count == 0 {
+		log.Log.Info("offering count reached zero, removing from tracking", "nodepool", npName, "instance", offeringKey.InstanceName, "zone", offeringKey.Zone, "capacity", offeringKey.CapacityType)
 		delete(npc.offeringCounts, offeringKey)
 	}
 	if len(lo.Values(npc.offeringCounts)) == 0 {
