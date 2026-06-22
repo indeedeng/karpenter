@@ -580,6 +580,30 @@ func (c *Cluster) NodePoolResourcesFor(nodePoolName string) corev1.ResourceList 
 	return maps.Clone(c.nodePoolResources[nodePoolName])
 }
 
+func (c *Cluster) NodePoolNodeClaimConditionsFor(nodePoolName string) []v1.NodeClaimConditions {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	conditions := map[string]int64{}
+	for _, node := range c.nodes {
+		if node.NodeClaim != nil && node.NodeClaim.Labels[v1.NodePoolLabelKey] == nodePoolName {
+			for _, condition := range node.NodeClaim.Status.Conditions {
+				if condition.IsTrue() {
+					conditions[condition.Type]++
+				}
+			}
+		}
+	}
+	nodeClaimConditions := make([]v1.NodeClaimConditions, 0, len(conditions))
+	for conditionType, count := range conditions {
+		nodeClaimConditions = append(nodeClaimConditions, v1.NodeClaimConditions{
+			ConditionType: &conditionType,
+			Count:         &count,
+		})
+	}
+	return nodeClaimConditions
+}
+
 // Reset the cluster state for unit testing
 func (c *Cluster) Reset() {
 	c.unsyncedTimeMu.Lock()
