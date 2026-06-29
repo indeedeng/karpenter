@@ -90,6 +90,11 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reco
 	nodePool.Status.Nodes = new(nodeQuantity.Value())
 	nodePool.Status.NodeClaimConditions = c.cluster.NodePoolNodeClaimConditionsFor(nodePool.Name)
 
+	if nodeClass, err := nodepoolutils.GetNodeClass(ctx, c.kubeClient, nodePool, c.cloudProvider); err == nil && nodeClass != nil {
+		current := c.cluster.NodePoolDriftEvaluationCurrent(nodePool.Name, nodePool.Generation, nodeClass.GetGeneration())
+		nodePool.Status.DriftEvaluationCurrent = &current
+	}
+
 	if !equality.Semantic.DeepEqual(stored, nodePool) {
 		if err := c.kubeClient.Status().Patch(ctx, nodePool, client.MergeFrom(stored)); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(err)
