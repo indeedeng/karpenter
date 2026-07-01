@@ -59,6 +59,11 @@ type NodePoolStatus struct {
 	// +listMapKey=conditionType
 	//nolint:kubeapilinter
 	NodeClaimConditions []NodeClaimConditions `json:"nodeClaimConditions,omitempty"`
+	//nolint:kubeapilinter
+	// DriftEvaluationCurrent is true when every NodeClaim in this NodePool has had drift
+	// evaluated against the current NodePool and referenced NodeClass generations.
+	// +optional
+	DriftEvaluationCurrent *bool `json:"driftEvaluationCurrent,omitempty"`
 }
 
 // NodeClaimConditions is a summary of nodeclaim conditions with this nodepool
