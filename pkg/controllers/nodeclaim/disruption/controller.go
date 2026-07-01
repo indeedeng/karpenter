@@ -75,6 +75,7 @@ func (c *Controller) Name() string {
 	return "nodeclaim.disruption"
 }
 
+//nolint:gocyclo
 func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 	if nodeClaim.Status.NodeName != "" {
