@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/result"
 )
 
@@ -74,6 +75,7 @@ func (c *Controller) Name() string {
 	return "nodeclaim.disruption"
 }
 
+//nolint:gocyclo
 func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 	if nodeClaim.Status.NodeName != "" {
@@ -94,6 +96,13 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 	results, errs := c.runReconcilers(ctx, nodePool, nodeClaim)
+	// Record the NodePool and NodeClass generations drift was evaluated against.
+	if errs == nil && nodeClaim.StatusConditions().Get(v1.ConditionTypeLaunched).IsTrue() {
+		nodeClaim.Status.DriftObservedNodePoolGeneration = nodePool.Generation
+		if nodeClass, err := nodepoolutils.GetNodeClass(ctx, c.kubeClient, nodePool, c.cloudProvider); err == nil && nodeClass != nil {
+			nodeClaim.Status.DriftObservedNodeClassGeneration = nodeClass.GetGeneration()
+		}
+	}
 	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
 		// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
 		// can cause races due to the fact that it fully replaces the list on a change

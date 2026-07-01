@@ -651,6 +651,24 @@ func (c *Cluster) NodePoolNodeClaimConditionsFor(nodePoolName string) []v1.NodeC
 	return nodeClaimConditions
 }
 
+// NodePoolDriftEvaluationCurrent returns true if every NodeClaim owned by the
+// given NodePool has had drift evaluated against at least the provided NodePool
+// and NodeClass generations. A NodePool with no NodeClaims is considered current.
+func (c *Cluster) NodePoolDriftEvaluationCurrent(nodePoolName string, nodePoolGeneration, nodeClassGeneration int64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, node := range c.nodes {
+		if node.NodeClaim != nil && node.NodeClaim.Labels[v1.NodePoolLabelKey] == nodePoolName {
+			if node.NodeClaim.Status.DriftObservedNodePoolGeneration < nodePoolGeneration ||
+				node.NodeClaim.Status.DriftObservedNodeClassGeneration < nodeClassGeneration {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // Reset the cluster state for unit testing
 func (c *Cluster) Reset() {
 	c.unsyncedTimeMu.Lock()

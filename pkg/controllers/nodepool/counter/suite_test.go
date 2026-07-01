@@ -20,6 +20,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/awslabs/operatorpkg/object"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -491,6 +492,64 @@ var _ = Describe("Counter", func() {
 			ExpectObjectReconciled(ctx, env.Client, nodePoolController, nodePool)
 			nodePool = ExpectExists(ctx, env.Client, nodePool)
 			Expect(nodePool.Status.NodeClaimConditions).To(BeNil())
+		})
+	})
+	Context("Status.DriftEvaluationCurrent Field", func() {
+		var nodeClass *v1alpha1.TestNodeClass
+		BeforeEach(func() {
+			nodeClass = test.NodeClass(v1alpha1.TestNodeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: nodePool.Spec.Template.Spec.NodeClassRef.Name},
+			})
+			nodePool.Spec.Template.Spec.NodeClassRef.Group = object.GVK(nodeClass).Group
+			nodePool.Spec.Template.Spec.NodeClassRef.Kind = object.GVK(nodeClass).Kind
+			ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+			nodePool = ExpectExists(ctx, env.Client, nodePool)
+			nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+		})
+		It("should set DriftEvaluationCurrent to true when no NodeClaims exist", func() {
+			ExpectObjectReconciled(ctx, env.Client, nodePoolController, nodePool)
+			nodePool = ExpectExists(ctx, env.Client, nodePool)
+
+			Expect(nodePool.Status.DriftEvaluationCurrent).ToNot(BeNil())
+			Expect(*nodePool.Status.DriftEvaluationCurrent).To(BeTrue())
+		})
+		It("should set DriftEvaluationCurrent to false when a NodeClaim has not been evaluated for the current generations", func() {
+			ExpectApplied(ctx, env.Client, node, nodeClaim)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+			ExpectObjectReconciled(ctx, env.Client, nodePoolController, nodePool)
+			nodePool = ExpectExists(ctx, env.Client, nodePool)
+
+			Expect(nodePool.Status.DriftEvaluationCurrent).ToNot(BeNil())
+			Expect(*nodePool.Status.DriftEvaluationCurrent).To(BeFalse())
+		})
+		It("should set DriftEvaluationCurrent to true when all NodeClaims have been evaluated for the current generations", func() {
+			nodeClaim.Status.DriftObservedNodePoolGeneration = nodePool.Generation
+			nodeClaim.Status.DriftObservedNodeClassGeneration = nodeClass.Generation
+			ExpectApplied(ctx, env.Client, node, nodeClaim)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+			ExpectObjectReconciled(ctx, env.Client, nodePoolController, nodePool)
+			nodePool = ExpectExists(ctx, env.Client, nodePool)
+
+			Expect(nodePool.Status.DriftEvaluationCurrent).ToNot(BeNil())
+			Expect(*nodePool.Status.DriftEvaluationCurrent).To(BeTrue())
+		})
+		It("should set DriftEvaluationCurrent to false when the NodeClass generation has advanced past the last evaluation", func() {
+			nodeClaim.Status.DriftObservedNodePoolGeneration = nodePool.Generation
+			nodeClaim.Status.DriftObservedNodeClassGeneration = nodeClass.Generation
+			ExpectApplied(ctx, env.Client, node, nodeClaim)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+			// Mutate the NodeClass spec to bump its generation.
+			nodeClass.Spec.Tags = map[string]string{"key": "value"}
+			ExpectApplied(ctx, env.Client, nodeClass)
+
+			ExpectObjectReconciled(ctx, env.Client, nodePoolController, nodePool)
+			nodePool = ExpectExists(ctx, env.Client, nodePool)
+
+			Expect(nodePool.Status.DriftEvaluationCurrent).ToNot(BeNil())
+			Expect(*nodePool.Status.DriftEvaluationCurrent).To(BeFalse())
 		})
 	})
 })

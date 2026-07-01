@@ -90,6 +90,11 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reco
 	nodePool.Status.Nodes = new(nodeQuantity.Value())
 	nodePool.Status.NodeClaimConditions = c.cluster.NodePoolNodeClaimConditionsFor(nodePool.Name)
 
+	if nodeClass, err := nodepoolutils.GetNodeClass(ctx, c.kubeClient, nodePool, c.cloudProvider); err == nil && nodeClass != nil {
+		current := c.cluster.NodePoolDriftEvaluationCurrent(nodePool.Name, nodePool.Generation, nodeClass.GetGeneration())
+		nodePool.Status.DriftEvaluationCurrent = &current
+	}
+
 	if !equality.Semantic.DeepEqual(stored, nodePool) {
 		if err := c.kubeClient.Status().Patch(ctx, nodePool, client.MergeFrom(stored)); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(err)
@@ -99,13 +104,18 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reco
 }
 
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
-	return controllerruntime.NewControllerManagedBy(m).
+	b := controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		For(&v1.NodePool{}, builder.WithPredicates(nodepoolutils.IsManagedPredicateFuncs(c.cloudProvider), predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool { return true },
-			UpdateFunc: func(e event.UpdateEvent) bool { return false },
+			UpdateFunc: func(e event.UpdateEvent) bool {
+				return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
+			},
 			DeleteFunc: func(e event.DeleteEvent) bool { return false },
 		})).
-		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000)}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000)})
+	for _, nodeClass := range c.cloudProvider.GetSupportedNodeClasses() {
+		b.Watches(nodeClass, nodepoolutils.NodeClassEventHandler(c.kubeClient))
+	}
+	return b.Complete(reconcile.AsReconciler(m.GetClient(), c))
 }

@@ -69,6 +69,14 @@ type NodeClaimStatus struct {
 	// is also considered as removed.
 	// +optional
 	LastPodEventTime metav1.Time `json:"lastPodEventTime,omitempty"`
+	//nolint:kubeapilinter
+	// DriftObservedNodePoolGeneration is the NodePool generation drift was most recently evaluated against.
+	// +optional
+	DriftObservedNodePoolGeneration int64 `json:"driftObservedNodePoolGeneration,omitempty"`
+	//nolint:kubeapilinter
+	// DriftObservedNodeClassGeneration is the NodeClass generation drift was most recently evaluated against.
+	// +optional
+	DriftObservedNodeClassGeneration int64 `json:"driftObservedNodeClassGeneration,omitempty"`
 }
 
 func (in *NodeClaim) StatusConditions(opts ...status.ForOption) status.ConditionSet {
