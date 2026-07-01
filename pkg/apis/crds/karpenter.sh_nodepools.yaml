@@ -525,6 +525,11 @@ spec:
                   x-kubernetes-list-map-keys:
                     - type
                   x-kubernetes-list-type: map
+                driftEvaluationCurrent:
+                  description: |-
+                    DriftEvaluationCurrent is true when every NodeClaim in this NodePool has had drift
+                    evaluated against the current NodePool and referenced NodeClass generations.
+                  type: boolean
                 nodeClaimConditions:
                   description: NodeClaimConditions contains summary of nodeclaim conditions with this nodepool
                   items:
