@@ -20,6 +20,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/awslabs/operatorpkg/object"
 	"github.com/imdario/mergo"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
+	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 )
 
 var _ = Describe("Drift", func() {
@@ -569,5 +571,26 @@ var _ = Describe("Drift", func() {
 			Entry("should drift when a matching instance type exists but the only offering is spot", true, v1.CapacityTypeSpot),
 			Entry("should drift when a matching instance type exists but there are no compatible offerings", true),
 		)
+	})
+	Context("Drift Observed Generations", func() {
+		var nodeClass *v1alpha1.TestNodeClass
+		BeforeEach(func() {
+			nodeClass = test.NodeClass(v1alpha1.TestNodeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: nodePool.Spec.Template.Spec.NodeClassRef.Name},
+			})
+			nodePool.Spec.Template.Spec.NodeClassRef.Group = object.GVK(nodeClass).Group
+			nodePool.Spec.Template.Spec.NodeClassRef.Kind = object.GVK(nodeClass).Kind
+			nodeClaim.Spec.NodeClassRef = nodePool.Spec.Template.Spec.NodeClassRef
+		})
+		It("should stamp the NodePool and NodeClass generations that drift was evaluated against", func() {
+			ExpectApplied(ctx, env.Client, nodePool, nodeClass, nodeClaim)
+			nodePool = ExpectExists(ctx, env.Client, nodePool)
+			nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimDisruptionController, nodeClaim)
+
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.Status.DriftObservedNodePoolGeneration).To(Equal(nodePool.Generation))
+			Expect(nodeClaim.Status.DriftObservedNodeClassGeneration).To(Equal(nodeClass.Generation))
+		})
 	})
 })
