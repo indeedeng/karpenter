@@ -128,4 +128,14 @@ var (
 		},
 		[]string{decisionLabel, metrics.ReasonLabel, ConsolidationTypeLabel},
 	)
+	DriftBackoffsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "drift_backoffs_total",
+			Help:      "The number of times a NodePool entered or escalated drift replacement back-off after an unrecoverable failure. Labeled by NodePool.",
+		},
+		[]string{metrics.NodePoolLabel},
+	)
 )
