@@ -3050,6 +3050,9 @@ var _ = Describe("Consolidation", func() {
 			Expect(ok).To(BeTrue())
 		})
 		It("should not consolidate pods onto a destination node that is under its consolidateAfter window", func() {
+			if os.Getenv("INDEED_ENFORCE_CONSOLIDATE_AFTER") == "false" {
+				Skip("consolidateAfter destination enforcement is disabled")
+			}
 			// Override consolidateAfter to a nonzero duration.
 			// Both nodes are leastExpensiveInstance (from BeforeEach), so no cheaper replacement
 			// exists — the only consolidation path is to delete nodes[1] and move its pod
