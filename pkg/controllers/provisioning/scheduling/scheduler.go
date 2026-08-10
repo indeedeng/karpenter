@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -120,8 +121,18 @@ var MinValuesPolicy = func(policy karpopts.MinValuesPolicy) func(*options) {
 	}
 }
 
+// enforceConsolidateAfter excludes nodes inside their consolidateAfter window from being
+// rescheduling destinations during consolidation simulations. Setting
+// INDEED_ENFORCE_CONSOLIDATE_AFTER=false restores the v1.13 behavior, where those nodes were
+// excluded as consolidation candidates but still accepted pods from candidates being removed.
+var enforceConsolidateAfterEnabled = sync.OnceValue(func() bool {
+	enabled := os.Getenv("INDEED_ENFORCE_CONSOLIDATE_AFTER") != "false"
+	log.Log.WithName("scheduling").Info("resolved consolidateAfter destination enforcement", "enforceConsolidateAfter", enabled)
+	return enabled
+})
+
 var IsConsolidationSimulation = func(opts *options) {
-	opts.enforceConsolidateAfter = true
+	opts.enforceConsolidateAfter = enforceConsolidateAfterEnabled()
 }
 
 func NewScheduler(
