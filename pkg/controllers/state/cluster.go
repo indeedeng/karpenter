@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"iter"
 	"maps"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -126,6 +127,16 @@ func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovid
 	}
 }
 
+// Synced treats a NodeClaim without a resolved provider ID as unsynced, which blocks all
+// operations that depend on cluster state until every NodeClaim has launched. Setting
+// INDEED_DISABLE_CLUSTER_SYNC_FOR_PROVIDER_IDS=true skips that check so a NodeClaim which
+// never resolves a provider ID can't stall provisioning and disruption cluster-wide.
+var providerIDSyncCheckDisabled = sync.OnceValue(func() bool {
+	disabled := os.Getenv("INDEED_DISABLE_CLUSTER_SYNC_FOR_PROVIDER_IDS") == "true"
+	log.Log.WithName("state").Info("resolved cluster sync provider ID check", "disableClusterSyncForProviderIDs", disabled)
+	return disabled
+})
+
 // Synced validates that the NodeClaims and the Nodes that are stored in the apiserver
 // have the same representation in the cluster state. This is to ensure that our view
 // of the cluster is as close to correct as it can be when we begin to perform operations
@@ -166,6 +177,9 @@ func (c *Cluster) Synced(ctx context.Context) (synced bool) {
 	// with each other to avoid having to continually re-check that we have fully captured the same view
 	// of cluster state that controller-runtime has
 	if c.hasSynced.Load() {
+		if providerIDSyncCheckDisabled() {
+			return true
+		}
 		c.mu.RLock()
 		defer c.mu.RUnlock()
 
