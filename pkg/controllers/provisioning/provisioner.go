@@ -56,6 +56,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -89,11 +90,13 @@ type Provisioner struct {
 	cm                         *pretty.ChangeMonitor
 	clock                      clock.Clock
 	deviceAllocationController *deviceallocation.Controller
+	launchBackoff              *launchbackoff.Tracker
 }
 
 func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 	cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster,
 	clock clock.Clock, deviceAllocationController *deviceallocation.Controller,
+	launchBackoff *launchbackoff.Tracker,
 ) *Provisioner {
 	p := &Provisioner{
 		batcher:                    NewBatcher[types.UID](clock),
@@ -105,6 +108,7 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 		cm:                         pretty.NewChangeMonitor(),
 		clock:                      clock,
 		deviceAllocationController: deviceAllocationController,
+		launchBackoff:              launchBackoff,
 	}
 	return p
 }
@@ -126,6 +130,11 @@ func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
 
 func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, err error) {
 	ctx = injection.WithControllerName(ctx, p.Name())
+
+	// Reclaim launch backoff state that has gone quiet. This rides the provisioning loop rather
+	// than a controller of its own because it is a small map sweep and this is the only
+	// singleton that already runs on the cadence the backoff windows are measured in.
+	p.launchBackoff.GC()
 
 	// Batch pods
 	if triggered := p.batcher.Wait(ctx); !triggered {
