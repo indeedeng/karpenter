@@ -27,6 +27,7 @@ import (
 	"github.com/samber/lo"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	corev1 "k8s.io/api/core/v1"
@@ -101,9 +102,14 @@ func NewControllers(
 	// them is unavailable to all of them, and the per-NodePool budgets only bound anything if
 	// every path that can launch consumes from the same allowance.
 	launchBackoff := launchbackoff.NewTracker(clock)
+	// Logged unconditionally so that a cluster reporting unexpected launch rates can be settled
+	// from its startup logs, without inferring the gate's state from the absence of behavior.
+	log.FromContext(ctx).WithValues(
+		"enabled", options.FromContext(ctx).FeatureGates.LaunchBackoff,
+	).Info("insufficient capacity launch backoff")
 	p := provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, launchBackoff)
 	evictionQueue := terminator.NewQueue(kubeClient, recorder)
-	disruptionQueue := disruption.NewQueue(kubeClient, recorder, cluster, clock, p)
+	disruptionQueue := disruption.NewQueue(kubeClient, recorder, cluster, clock, p, launchBackoff)
 	npState := nodepoolhealth.NewState()
 	clusterCost := cost.NewClusterCost(ctx, cloudProvider, kubeClient)
 	controllers := []controller.Controller{

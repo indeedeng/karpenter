@@ -315,7 +315,11 @@ func (p *Provisioner) NewScheduler(
 			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, no resolved instance types found")
 			continue
 		}
-		instanceTypes[np.Name] = its
+		// Must happen before these reach NewTopology or the scheduler, both of which trigger the
+		// InstanceType precompute. FilterUnavailable copies the affected types, so the copy
+		// precomputes against the cleared Available flags rather than inheriting the provider's
+		// cached view.
+		instanceTypes[np.Name] = launchbackoff.FilterUnavailable(ctx, its, p.launchBackoff)
 	}
 
 	// Get volume topology requirements WITHOUT modifying pods.

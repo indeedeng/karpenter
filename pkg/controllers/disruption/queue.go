@@ -55,6 +55,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
@@ -102,11 +103,12 @@ type Queue struct {
 	clock               clock.Clock
 	provisioner         *provisioning.Provisioner
 	backoff             *NodePoolBackoff
+	launchBackoff       *launchbackoff.Tracker
 }
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
 func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock,
-	provisioner *provisioning.Provisioner,
+	provisioner *provisioning.Provisioner, launchBackoff *launchbackoff.Tracker,
 ) *Queue {
 	queue := &Queue{
 		// nolint:staticcheck
@@ -119,6 +121,7 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 		clock:               clock,
 		provisioner:         provisioner,
 		backoff:             NewNodePoolBackoff(clock),
+		launchBackoff:       launchBackoff,
 	}
 	return queue
 }

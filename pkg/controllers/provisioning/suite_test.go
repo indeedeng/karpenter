@@ -67,6 +67,7 @@ var (
 	prov                *provisioning.Provisioner
 	env                 *test.Environment
 	instanceTypeMap     map[string]*cloudprovider.InstanceType
+	launchBackoff       *launchbackoff.Tracker
 )
 
 func TestAPIs(t *testing.T) {
@@ -81,7 +82,8 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
 	nodeController = informer.NewNodeController(env.Client, cluster)
-	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), launchbackoff.NewTracker(env.Clock))
+	launchBackoff = launchbackoff.NewTracker(env.Clock)
+	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), launchBackoff)
 	daemonsetController = informer.NewDaemonSetController(env.Client, cluster)
 	instanceTypes, _ := cloudProvider.GetInstanceTypes(ctx, nil)
 	instanceTypeMap = map[string]*cloudprovider.InstanceType{}
@@ -3456,3 +3458,57 @@ func AddInstanceResources(instanceTypes []*cloudprovider.InstanceType, resources
 	))
 	return instanceTypes
 }
+
+var _ = Describe("Launch Backoff", func() {
+	const instanceTypeName = "test-instance-type"
+	var pod *corev1.Pod
+
+	// The fake instance type offers exactly one capacity pool in test-zone-3. Pinning the pod there
+	// means backing that pool off leaves it nowhere to go, so these specs assert that the filter
+	// removed the offering rather than that the scheduler happened to prefer somewhere else.
+	onlyPoolInZone3 := cloudprovider.OfferingKey{
+		InstanceType: instanceTypeName,
+		CapacityType: v1.CapacityTypeOnDemand,
+		Zone:         "test-zone-3",
+	}
+
+	BeforeEach(func() {
+		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+			FeatureGates: test.FeatureGates{LaunchBackoff: lo.ToPtr(true)},
+		}))
+		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{fake.NewInstanceType(instanceTypeName)}
+		pod = test.UnschedulablePod(test.PodOptions{
+			NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-3"},
+		})
+		ExpectApplied(ctx, env.Client, test.NodePool())
+	})
+
+	It("should provision normally when no offering has failed", func() {
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+
+		ExpectScheduled(ctx, env.Client, pod)
+	})
+	It("should not provision into a backed-off offering", func() {
+		launchBackoff.Fail(ctx, onlyPoolInZone3)
+
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+
+		ExpectNotScheduled(ctx, env.Client, pod)
+	})
+	It("should provision again once the backoff window elapses", func() {
+		launchBackoff.Fail(ctx, onlyPoolInZone3)
+		env.Clock.Step(launchbackoff.BaseDelay + launchbackoff.MaxDelay)
+
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+
+		ExpectScheduled(ctx, env.Client, pod)
+	})
+	It("should ignore the backoff while the feature gate is off", func() {
+		ctx = options.ToContext(ctx, test.Options())
+		launchBackoff.Fail(ctx, onlyPoolInZone3)
+
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+
+		ExpectScheduled(ctx, env.Client, pod)
+	})
+})
