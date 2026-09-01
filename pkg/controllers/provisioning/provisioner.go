@@ -167,10 +167,60 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 	if len(results.NewNodeClaims) == 0 {
 		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 	}
-	if _, err = p.CreateNodeClaims(ctx, results.NewNodeClaims, WithReason(metrics.ProvisionedReason), RecordPodNomination); err != nil {
+	// Consumed here rather than inside CreateNodeClaims: that function is shared with the disruption
+	// queue, which requires len(names) == len(replacements) after its candidates may already be
+	// cordoned, so it must never silently omit.
+	//
+	// Omitted NodeClaims need no requeue of their own. Their pods stay provisionable, and the pod
+	// controller re-triggers this loop every 10s — sooner than any backoff window elapses.
+	admitted := p.admit(ctx, results.NewNodeClaims)
+	if len(admitted) == 0 {
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+	}
+	if _, err = p.CreateNodeClaims(ctx, admitted, WithReason(metrics.ProvisionedReason), RecordPodNomination); err != nil {
 		return reconciler.Result{}, err
 	}
 	return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+}
+
+// admit returns the NodeClaims the per-NodePool launch budgets allow this round.
+//
+// Non-risky NodeClaims are offered first. A NodeClaim with at least one offering that has not failed
+// recently should not queue behind probes for pools already known to be short, otherwise a shortage
+// in one zone throttles the launches that would have succeeded in another. The same walk supplies
+// both the ordering and the risky argument, so there is no second pass, and it is skipped entirely
+// when the tracker holds no offering state.
+func (p *Provisioner) admit(ctx context.Context, nodeClaims []*scheduler.NodeClaim) []*scheduler.NodeClaim {
+	risky := make([]bool, len(nodeClaims))
+	order := make([]int, 0, len(nodeClaims))
+	for i, nc := range nodeClaims {
+		risky[i] = p.launchBackoff.IsRisky(ctx, nc.InstanceTypeOptions)
+		if !risky[i] {
+			order = append(order, i)
+		}
+	}
+	for i := range nodeClaims {
+		if risky[i] {
+			order = append(order, i)
+		}
+	}
+	admitted := make([]*scheduler.NodeClaim, 0, len(nodeClaims))
+	for _, i := range order {
+		if p.launchBackoff.Admit(ctx, nodeClaims[i].NodePoolUUID, risky[i]) {
+			admitted = append(admitted, nodeClaims[i])
+			continue
+		}
+		// A risky NodeClaim on a constrained pool has to clear both gates, so a refusal cannot be
+		// attributed to one of them. Report the pool being constrained in that case, since that is
+		// the condition an operator would act on; a bare risky refusal means the pool has recovered
+		// and only the probe rate is holding this launch back.
+		launchbackoff.NodePoolsLaunchThrottledTotal.Inc(map[string]string{
+			metrics.NodePoolLabel: nodeClaims[i].NodePoolName,
+			metrics.ReasonLabel: lo.Ternary(p.launchBackoff.IsConstrained(ctx, nodeClaims[i].NodePoolUUID),
+				launchbackoff.ThrottledReasonConstrained, launchbackoff.ThrottledReasonRisky),
+		})
+	}
+	return admitted
 }
 
 // CreateNodeClaims launches nodes passed into the function in parallel. It returns a slice of the successfully created node

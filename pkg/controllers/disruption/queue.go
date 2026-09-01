@@ -363,6 +363,17 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	if q.HasAny(providerIDs...) {
 		return fmt.Errorf("candidate is being disrupted")
 	}
+	// Checked before anything is cordoned. Disruption is discretionary: replacing a healthy node from
+	// a NodePool that just failed to launch spends a probe that pending pods need more, and leaves a
+	// cordoned node behind if the replacement then fails too. All-or-nothing across replacement pools
+	// because a partially launched command still deletes every candidate.
+	//
+	// A peek, not an Admit: consuming the probe here is what would starve provisioning.
+	if constrained, ok := lo.Find(cmd.Replacements, func(r *Replacement) bool {
+		return q.launchBackoff.IsConstrained(ctx, r.NodePoolUUID)
+	}); ok {
+		return serrors.Wrap(fmt.Errorf("nodepool is recovering from insufficient capacity"), "NodePool", klog.KRef("", constrained.NodePoolName))
+	}
 
 	log.FromContext(ctx).WithValues(append([]any{
 		"command", cmd.String(),

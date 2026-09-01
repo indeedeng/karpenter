@@ -262,7 +262,9 @@ func (t *Tracker) IsConstrained(ctx context.Context, nodePoolUID types.UID) bool
 // FailPool engages the aggregate budget for a NodePool at its floor. Idempotent inside a
 // window, matching Fail.
 func (t *Tracker) FailPool(ctx context.Context, nodePoolUID types.UID) {
-	if !enabled(ctx) {
+	// An empty UID is a NodeClaim with no owning NodePool. Recording it would collect every such
+	// NodeClaim into one shared budget that no NodePool can ever clear.
+	if !enabled(ctx) || nodePoolUID == "" {
 		return
 	}
 	t.mu.Lock()
@@ -287,7 +289,7 @@ func (t *Tracker) FailPool(ctx context.Context, nodePoolUID types.UID) {
 // first success bounds the overshoot to BurstMax when capacity has only marginally returned,
 // while still reaching full speed in a few windows when it genuinely has.
 func (t *Tracker) SucceedPool(ctx context.Context, nodePoolUID types.UID) {
-	if !enabled(ctx) {
+	if !enabled(ctx) || nodePoolUID == "" {
 		return
 	}
 	t.mu.Lock()

@@ -21,10 +21,12 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/awslabs/operatorpkg/object"
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -34,6 +36,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 )
 
 type Launch struct {
@@ -42,6 +45,7 @@ type Launch struct {
 	cache         *cache.Cache // exists due to eventual consistency on the cache
 	recorder      events.Recorder
 	clock         clock.Clock
+	launchBackoff *launchbackoff.Tracker
 }
 
 func (l *Launch) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
@@ -85,6 +89,9 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 		case cloudprovider.IsInsufficientCapacityError(err):
 			l.recorder.Publish(InsufficientCapacityErrorEvents(ctx, l.kubeClient, nodeClaim, err)...)
 			log.FromContext(ctx).Error(err, "failed launching nodeclaim")
+			// Recorded before the delete below, which returns early on error and would otherwise drop
+			// the only evidence that this pool is short.
+			l.observeLaunchFailure(ctx, nodeClaim, err)
 
 			if err = l.kubeClient.Delete(ctx, nodeClaim); err != nil {
 				return nil, client.IgnoreNotFound(err)
@@ -121,6 +128,8 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 		delete(nodeClaim.Annotations, "karpenter.indeed.com/nominated-pods")
 	}
 
+	l.observeLaunchSuccess(ctx, nodeClaim, created)
+
 	log.FromContext(ctx).WithValues(
 		"provider-id", created.Status.ProviderID,
 		"instance-type", created.Labels[corev1.LabelInstanceTypeStable],
@@ -128,6 +137,65 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 		"capacity-type", created.Labels[v1.CapacityTypeLabelKey],
 		"allocatable", created.Status.Allocatable).Info("launched nodeclaim")
 	return created, nil
+}
+
+// observeLaunchFailure feeds an insufficient capacity failure back to the launch backoff tracker.
+//
+// The keys the provider attributed back off exactly the pools that refused. The NodePool budget is
+// armed regardless, so a provider that attributes nothing still gets a bound on how fast Karpenter
+// retries — it just bounds the whole NodePool rather than the pools actually short.
+func (l *Launch) observeLaunchFailure(ctx context.Context, nodeClaim *v1.NodeClaim, err error) {
+	var ice *cloudprovider.InsufficientCapacityError
+	var keys []cloudprovider.OfferingKey
+	if errors.As(err, &ice) {
+		keys = ice.Keys
+	}
+	for _, key := range keys {
+		l.launchBackoff.Fail(ctx, key)
+	}
+	l.launchBackoff.FailPool(ctx, nodePoolUID(nodeClaim))
+
+	// Counted whether or not the gate is on. An operator deciding whether to enable backoff needs to
+	// see the failure rate it would be acting on first.
+	if len(keys) == 0 {
+		launchbackoff.OfferingsLaunchFailuresTotal.Inc(map[string]string{
+			metrics.InstanceTypeLabel: "",
+			metrics.CapacityTypeLabel: "",
+			metrics.ZoneLabel:         "",
+		})
+		return
+	}
+	for _, key := range keys {
+		launchbackoff.OfferingsLaunchFailuresTotal.Inc(map[string]string{
+			metrics.InstanceTypeLabel: key.InstanceType,
+			metrics.CapacityTypeLabel: key.CapacityType,
+			metrics.ZoneLabel:         key.Zone,
+		})
+	}
+}
+
+// observeLaunchSuccess clears backoff for the pool that just produced an instance. The labels come
+// from the created NodeClaim rather than the requested one, because the requested one carries the
+// set of offerings the launch was allowed to draw from, not the one it landed in.
+func (l *Launch) observeLaunchSuccess(ctx context.Context, nodeClaim, created *v1.NodeClaim) {
+	l.launchBackoff.Succeed(ctx, cloudprovider.OfferingKey{
+		InstanceType: created.Labels[corev1.LabelInstanceTypeStable],
+		CapacityType: created.Labels[v1.CapacityTypeLabelKey],
+		Zone:         created.Labels[corev1.LabelTopologyZone],
+	})
+	l.launchBackoff.SucceedPool(ctx, nodePoolUID(nodeClaim))
+}
+
+// nodePoolUID reads the owning NodePool's UID off the NodeClaim. Returns empty for a NodeClaim with
+// no NodePool owner, which the tracker treats as nothing to record.
+func nodePoolUID(nodeClaim *v1.NodeClaim) types.UID {
+	nodePoolKind := object.GVK(&v1.NodePool{}).Kind
+	for _, ref := range nodeClaim.OwnerReferences {
+		if ref.Kind == nodePoolKind {
+			return ref.UID
+		}
+	}
+	return ""
 }
 
 func PopulateNodeClaimDetails(nodeClaim, retrieved *v1.NodeClaim) *v1.NodeClaim {

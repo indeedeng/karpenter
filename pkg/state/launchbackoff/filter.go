@@ -51,6 +51,44 @@ func FilterUnavailable(ctx context.Context, instanceTypes []*cloudprovider.Insta
 	return filtered
 }
 
+// IsRisky reports whether a launch drawing on these instance types has nowhere untried to go —
+// every offering still usable has failed within recent memory. Such a launch is the one most likely
+// to fail again, so it is charged to the risky budget and admitted at most RiskyBurst per window
+// even on a NodePool the aggregate budget has released.
+//
+// This asks "has it ever failed" rather than "is it available now", because an offering whose window
+// has elapsed is precisely a probe candidate: it is usable again, but nothing has confirmed capacity
+// came back. Treating it as healthy is what would let a recovered pool launch a whole pending batch
+// into a zone that is still dead.
+//
+// Reports false for an empty offering set. Vacuous truth would classify a NodeClaim with nothing to
+// evaluate — a static one, say — as risky and throttle it for no reason.
+func (t *Tracker) IsRisky(ctx context.Context, instanceTypes []*cloudprovider.InstanceType) bool {
+	if !enabled(ctx) || t.Empty() {
+		return false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	now := t.clock.Now()
+	usable := 0
+	for _, it := range instanceTypes {
+		if it == nil {
+			continue
+		}
+		for _, o := range it.Offerings {
+			if !o.Available {
+				continue
+			}
+			usable++
+			if _, ok := t.live(o.Key(it.Name), now); !ok {
+				return false
+			}
+		}
+	}
+	return usable > 0
+}
+
 // filterInstanceType returns it unchanged when none of its offerings are backed off, so that
 // unaffected instance types keep their identity and their already-computed allocatables.
 func filterInstanceType(it *cloudprovider.InstanceType, t *Tracker) *cloudprovider.InstanceType {

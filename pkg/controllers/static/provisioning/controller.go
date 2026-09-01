@@ -56,6 +56,8 @@ type Controller struct {
 	cloudProvider cloudprovider.CloudProvider
 	provisioner   *provisioning.Provisioner
 	cluster       *state.Cluster
+	clock         clock.Clock
+	launchBackoff *launchbackoff.Tracker
 }
 
 func NewController(kubeClient client.Client, cluster *state.Cluster, recorder events.Recorder, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, clock clock.Clock, deviceAllocationController *deviceallocation.Controller, launchBackoff *launchbackoff.Tracker) *Controller {
@@ -63,6 +65,8 @@ func NewController(kubeClient client.Client, cluster *state.Cluster, recorder ev
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 		cluster:       cluster,
+		clock:         clock,
+		launchBackoff: launchBackoff,
 		// The tracker must be the one the dynamic provisioner uses, not a fresh one, or the two
 		// controllers each get their own budget and the per-NodePool bound is doubled.
 		provisioner: provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, launchBackoff),
@@ -109,20 +113,60 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 	log.FromContext(ctx).WithValues("current", runningNodeClaims, "desired", desiredReplicas, "provision-count", countNodeClaimsToProvision).
 		Info("provisioning nodeclaims to satisfy replica count")
 
-	nodeClaims := make([]*scheduling.NodeClaim, 0, countNodeClaimsToProvision)
-	for range countNodeClaimsToProvision {
+	return c.provision(ctx, np, countNodeClaimsToProvision)
+}
+
+// provision creates as many of the wanted replicas as the launch budget admits, and picks the retry
+// cadence: the next probe window when some were withheld, the steady-state poll when all went out.
+func (c *Controller) provision(ctx context.Context, np *v1.NodePool, wanted int64) (reconcile.Result, error) {
+	nodeClaims := c.admitReplicas(ctx, np, wanted)
+	if len(nodeClaims) > 0 {
+		if _, err := c.provisioner.CreateNodeClaims(ctx, nodeClaims, provisioning.WithReason(metrics.ProvisionedReason)); err != nil {
+			return reconcile.Result{}, fmt.Errorf("creating nodeclaims, %w", err)
+		}
+	}
+
+	// Unlike the pod-driven provisioner, nothing re-triggers this controller while a replica count
+	// goes unmet, so a throttled NodePool has to schedule its own retry for when the budget refills.
+	if int64(len(nodeClaims)) < wanted {
+		return reconcile.Result{RequeueAfter: max(c.launchBackoff.NextAdmit(np.UID, false).Sub(c.clock.Now()), time.Second)}, nil
+	}
+	return reconcile.Result{RequeueAfter: time.Minute}, nil
+}
+
+// admitReplicas builds templates for as many of the wanted replicas as the NodePool's launch budget
+// allows, releasing the node count reserved for any it withholds.
+//
+// Static NodeClaims are never risky: they carry no instance type options to classify, and the
+// replica count is an explicit request rather than a reaction to pending pods.
+func (c *Controller) admitReplicas(ctx context.Context, np *v1.NodePool, wanted int64) []*scheduling.NodeClaim {
+	admitted := int64(0)
+	for range wanted {
+		if !c.launchBackoff.Admit(ctx, np.UID, false) {
+			break
+		}
+		admitted++
+	}
+	if throttled := wanted - admitted; throttled > 0 {
+		// CreateNodeClaims releases a reservation per NodeClaim it is handed, so the ones we withhold
+		// have to be released here or the limit stays consumed until the process restarts.
+		c.cluster.NodePoolState.ReleaseNodeCount(np.Name, throttled)
+		launchbackoff.NodePoolsLaunchThrottledTotal.Add(float64(throttled), map[string]string{
+			metrics.NodePoolLabel: np.Name,
+			metrics.ReasonLabel:   launchbackoff.ThrottledReasonConstrained,
+		})
+		log.FromContext(ctx).WithValues("throttled-count", throttled, "provision-count", admitted).
+			Info("withholding nodeclaims after insufficient capacity")
+	}
+
+	nodeClaims := make([]*scheduling.NodeClaim, 0, admitted)
+	for range admitted {
 		nct := scheduling.NewNodeClaimTemplate(np)
 		nodeClaims = append(nodeClaims, &scheduling.NodeClaim{
 			NodeClaimTemplate: *nct,
 		})
 	}
-
-	_, err := c.provisioner.CreateNodeClaims(ctx, nodeClaims, provisioning.WithReason(metrics.ProvisionedReason))
-	if err != nil {
-		return reconcile.Result{}, fmt.Errorf("creating nodeclaims, %w", err)
-	}
-
-	return reconcile.Result{RequeueAfter: time.Minute}, nil
+	return nodeClaims
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {

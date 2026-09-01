@@ -19,6 +19,7 @@ package lifecycle_test
 import (
 	"fmt"
 
+	"github.com/awslabs/operatorpkg/object"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -26,6 +27,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -114,5 +116,89 @@ var _ = Describe("Launch", func() {
 		Expect(condition.Status).To(Equal(metav1.ConditionUnknown))
 		Expect(condition.Reason).To(Equal(conditionReason))
 		Expect(condition.Message).To(Equal(conditionMessage))
+	})
+
+	Context("Launch Backoff", func() {
+		var nodeClaim *v1.NodeClaim
+
+		BeforeEach(func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+				FeatureGates: test.FeatureGates{LaunchBackoff: lo.ToPtr(true)},
+			}))
+			// The owner reference has to carry the UID the API server assigned, since that is the key
+			// the tracker budgets a NodePool by.
+			ExpectApplied(ctx, env.Client, nodePool)
+			nodePool = ExpectExists(ctx, env.Client, nodePool)
+			nodeClaim = test.NodeClaim(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: object.GVK(&v1.NodePool{}).GroupVersion().String(),
+						Kind:       object.GVK(&v1.NodePool{}).Kind,
+						Name:       nodePool.Name,
+						UID:        nodePool.UID,
+					}},
+				},
+			})
+		})
+		AfterEach(func() {
+			launchBackoff.Delete(nodePool.UID)
+			ctx = options.ToContext(ctx, test.Options())
+		})
+
+		It("should constrain the owning nodepool on an insufficient capacity failure", func() {
+			cloudProvider.NextCreateErr = cloudprovider.NewInsufficientCapacityError(fmt.Errorf("all instance types were unavailable"))
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+
+			Expect(launchBackoff.IsConstrained(ctx, nodePool.UID)).To(BeTrue())
+		})
+		It("should back off the offerings the provider attributed the failure to", func() {
+			offering := cloudprovider.OfferingKey{InstanceType: "large", CapacityType: v1.CapacityTypeSpot, Zone: "test-zone-1a"}
+			cloudProvider.NextCreateErr = cloudprovider.NewInsufficientCapacityError(fmt.Errorf("no capacity"), offering)
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+
+			Expect(launchBackoff.IsAvailable(offering)).To(BeFalse())
+		})
+		It("should record the failure before deleting the nodeclaim", func() {
+			// The delete returns early on error, and it is the only thing standing between the
+			// failure and the record of it.
+			cloudProvider.NextCreateErr = cloudprovider.NewInsufficientCapacityError(fmt.Errorf("no capacity"))
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
+
+			Expect(launchBackoff.IsConstrained(ctx, nodePool.UID)).To(BeTrue())
+		})
+		It("should ramp the allowance of a constrained nodepool on a successful launch", func() {
+			launchBackoff.FailPool(ctx, nodePool.UID)
+			Expect(launchBackoff.Burst(nodePool.UID)).To(Equal(1))
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+
+			Expect(launchBackoff.Burst(nodePool.UID)).To(Equal(2))
+		})
+		It("should record nothing while the gate is disabled", func() {
+			// Read back through a gate-on context, since a gate-off read answers false regardless of
+			// what is stored and would pass even if the failure had been recorded.
+			gateOn := ctx
+			ctx = options.ToContext(ctx, test.Options())
+			// Offering entries are keyed globally and outlive the spec that recorded them, so this
+			// key has to be one no other spec touches.
+			offering := cloudprovider.OfferingKey{InstanceType: "gated", CapacityType: v1.CapacityTypeSpot, Zone: "test-zone-1a"}
+			cloudProvider.NextCreateErr = cloudprovider.NewInsufficientCapacityError(fmt.Errorf("no capacity"), offering)
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+
+			Expect(launchBackoff.IsConstrained(gateOn, nodePool.UID)).To(BeFalse())
+			Expect(launchBackoff.IsAvailable(offering)).To(BeTrue())
+		})
 	})
 })

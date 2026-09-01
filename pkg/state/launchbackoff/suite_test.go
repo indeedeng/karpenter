@@ -575,6 +575,73 @@ var _ = Describe("FilterUnavailable", func() {
 	})
 })
 
+var _ = Describe("IsRisky", func() {
+	var instanceTypes []*cloudprovider.InstanceType
+
+	BeforeEach(func() {
+		instanceTypes = []*cloudprovider.InstanceType{
+			fake.NewInstanceType("large", fake.WithOfferings(
+				offering(v1.CapacityTypeSpot, "zone-a"),
+				offering(v1.CapacityTypeOnDemand, "zone-a"),
+			)),
+		}
+	})
+
+	It("should not be risky with no failure history", func() {
+		Expect(tracker.IsRisky(ctx, instanceTypes)).To(BeFalse())
+	})
+	It("should not be risky while any usable offering has never failed", func() {
+		tracker.Fail(ctx, key("large", v1.CapacityTypeSpot, "zone-a"))
+
+		Expect(tracker.IsRisky(ctx, instanceTypes)).To(BeFalse())
+	})
+	It("should be risky once every usable offering has failed", func() {
+		tracker.Fail(ctx, key("large", v1.CapacityTypeSpot, "zone-a"))
+		tracker.Fail(ctx, key("large", v1.CapacityTypeOnDemand, "zone-a"))
+
+		Expect(tracker.IsRisky(ctx, instanceTypes)).To(BeTrue())
+	})
+	It("should stay risky after a backoff window elapses", func() {
+		// The elapsed window makes the offering usable again, which is the whole point of a probe.
+		// Treating it as healthy is what would let the pool launch a full batch into a dead zone.
+		tracker.Fail(ctx, key("large", v1.CapacityTypeSpot, "zone-a"))
+		tracker.Fail(ctx, key("large", v1.CapacityTypeOnDemand, "zone-a"))
+		fakeClock.Step(launchbackoff.BaseDelay * 2)
+
+		Expect(tracker.IsAvailable(key("large", v1.CapacityTypeSpot, "zone-a"))).To(BeTrue())
+		Expect(tracker.IsRisky(ctx, instanceTypes)).To(BeTrue())
+	})
+	It("should stop being risky once the failure history expires", func() {
+		tracker.Fail(ctx, key("large", v1.CapacityTypeSpot, "zone-a"))
+		tracker.Fail(ctx, key("large", v1.CapacityTypeOnDemand, "zone-a"))
+		fakeClock.Step(launchbackoff.BaseDelay + launchbackoff.MaxDelay + time.Second)
+
+		Expect(tracker.IsRisky(ctx, instanceTypes)).To(BeFalse())
+	})
+	It("should ignore offerings the provider already marked unavailable", func() {
+		// The launch could never have drawn on them, so their history says nothing about whether
+		// this NodeClaim has somewhere untried to go.
+		instanceTypes = []*cloudprovider.InstanceType{
+			fake.NewInstanceType("large", fake.WithOfferings(
+				offering(v1.CapacityTypeSpot, "zone-a"),
+				unavailableOffering(v1.CapacityTypeOnDemand, "zone-a"),
+			)),
+		}
+		tracker.Fail(ctx, key("large", v1.CapacityTypeSpot, "zone-a"))
+
+		Expect(tracker.IsRisky(ctx, instanceTypes)).To(BeTrue())
+	})
+	It("should not be risky with no offerings to evaluate", func() {
+		Expect(tracker.IsRisky(ctx, nil)).To(BeFalse())
+	})
+	It("should not be risky while the gate is disabled", func() {
+		tracker.Fail(ctx, key("large", v1.CapacityTypeSpot, "zone-a"))
+		tracker.Fail(ctx, key("large", v1.CapacityTypeOnDemand, "zone-a"))
+
+		Expect(tracker.IsRisky(withGate(false), instanceTypes)).To(BeFalse())
+	})
+})
+
 var _ = Describe("Feature gate", func() {
 	spotA := key("large", v1.CapacityTypeSpot, "zone-a")
 
