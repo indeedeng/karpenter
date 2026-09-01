@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -63,6 +64,12 @@ type CloudProvider struct {
 	DeleteCalls        []*v1.NodeClaim
 	GetCalls           []string
 
+	// CapacityUnavailable models capacity pools the cloud has no room in. A Create that resolves to
+	// one of them fails with an InsufficientCapacityError attributed to that pool. Unlike
+	// NextCreateErr this persists across calls and reports which pool refused, which is what lets a
+	// test exercise per-offering backoff end to end rather than hand-building the error.
+	CapacityUnavailable sets.Set[cloudprovider.OfferingKey]
+
 	CreatedNodeClaims         map[string]*v1.NodeClaim
 	Drifted                   cloudprovider.DriftReason
 	NodeClassGroupVersionKind []schema.GroupVersionKind
@@ -88,6 +95,7 @@ func (c *CloudProvider) Reset() {
 	c.InstanceTypesForNodePool = map[string][]*cloudprovider.InstanceType{}
 	c.ErrorsForNodePool = map[string]error{}
 	c.AllowedCreateCalls = math.MaxInt
+	c.CapacityUnavailable = sets.New[cloudprovider.OfferingKey]()
 	c.NextCreateErr = nil
 	c.NextDeleteErr = nil
 	c.NextGetErr = nil
@@ -173,6 +181,12 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *v1.NodeClaim) (*v
 	// Propagate labels dictated by offering requirements - e.g. zone, capacity-type, and reservation-id
 	for _, req := range offering.Requirements {
 		labels[req.Key] = req.Any()
+	}
+
+	// Checked after the offering is resolved, since which pool refuses depends on where the launch
+	// actually landed rather than on the whole compatible set.
+	if key := offering.Key(instanceType.Name); c.CapacityUnavailable.Has(key) {
+		return nil, cloudprovider.NewInsufficientCapacityError(serrors.Wrap(fmt.Errorf("insufficient capacity"), "offering", key), key)
 	}
 
 	created := &v1.NodeClaim{

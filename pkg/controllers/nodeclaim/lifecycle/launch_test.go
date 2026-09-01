@@ -23,7 +23,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -162,6 +164,28 @@ var _ = Describe("Launch", func() {
 			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
 
 			Expect(launchBackoff.IsAvailable(offering)).To(BeFalse())
+		})
+		It("should back off the pool the cloud provider actually refused", func() {
+			// The one spec that closes the loop through a provider rather than a hand-built error:
+			// the fake attributes the failure to the pool the launch landed in, and core backs off
+			// exactly that pool.
+			//
+			// Where a launch lands is discovered rather than hardcoded, so this does not depend on
+			// the fake's instance type fixture.
+			probe, err := cloudProvider.Create(ctx, nodeClaim.DeepCopy())
+			Expect(err).To(Succeed())
+			landed := cloudprovider.OfferingKey{
+				InstanceType: probe.Labels[corev1.LabelInstanceTypeStable],
+				CapacityType: probe.Labels[v1.CapacityTypeLabelKey],
+				Zone:         probe.Labels[corev1.LabelTopologyZone],
+			}
+			cloudProvider.CapacityUnavailable = sets.New(landed)
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+
+			Expect(launchBackoff.IsAvailable(landed)).To(BeFalse())
+			Expect(launchBackoff.IsConstrained(ctx, nodePool.UID)).To(BeTrue())
 		})
 		It("should record the failure before deleting the nodeclaim", func() {
 			// The delete returns early on error, and it is the only thing standing between the

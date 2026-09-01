@@ -575,6 +575,62 @@ var _ = Describe("FilterUnavailable", func() {
 	})
 })
 
+var _ = Describe("Snapshots", func() {
+	spotA := key("large", v1.CapacityTypeSpot, "zone-a")
+	spotB := key("large", v1.CapacityTypeSpot, "zone-b")
+
+	It("should report no unavailable offerings with no history", func() {
+		Expect(tracker.UnavailableOfferings()).To(BeEmpty())
+	})
+	It("should report an offering inside its backoff window", func() {
+		tracker.Fail(ctx, spotA)
+
+		Expect(tracker.UnavailableOfferings()).To(ConsistOf(spotA))
+	})
+	It("should omit an offering whose window has elapsed but whose history remains", func() {
+		// The snapshot answers "what is blocked right now", so a probe-eligible offering must not
+		// appear even though the tracker still remembers it failed.
+		tracker.Fail(ctx, spotA)
+		tracker.Fail(ctx, spotB)
+		fakeClock.Step(launchbackoff.BaseDelay * 2)
+		tracker.Fail(ctx, spotB)
+
+		Expect(tracker.HasFailed(spotA)).To(BeTrue())
+		Expect(tracker.UnavailableOfferings()).To(ConsistOf(spotB))
+	})
+	It("should omit an offering that has succeeded", func() {
+		tracker.Fail(ctx, spotA)
+		tracker.Succeed(ctx, spotA)
+
+		Expect(tracker.UnavailableOfferings()).To(BeEmpty())
+	})
+	It("should report no constrained pools with no history", func() {
+		Expect(tracker.ConstrainedPools()).To(BeEmpty())
+	})
+	It("should report a constrained pool at the burst floor", func() {
+		tracker.FailPool(ctx, nodePool)
+
+		Expect(tracker.ConstrainedPools()).To(Equal(map[types.UID]int{nodePool: 1}))
+	})
+	It("should report the ceiling rather than the remaining allowance", func() {
+		// Consuming the window must not move the reported number, or the graph sawtooths and hides
+		// whether the pool is recovering.
+		tracker.FailPool(ctx, nodePool)
+		tracker.SucceedPool(ctx, nodePool)
+		Expect(tracker.Admit(ctx, nodePool, false)).To(BeTrue())
+
+		Expect(tracker.ConstrainedPools()).To(Equal(map[types.UID]int{nodePool: 2}))
+	})
+	It("should omit a pool that has been released", func() {
+		tracker.FailPool(ctx, nodePool)
+		for range 4 {
+			tracker.SucceedPool(ctx, nodePool)
+		}
+
+		Expect(tracker.ConstrainedPools()).To(BeEmpty())
+	})
+})
+
 var _ = Describe("IsRisky", func() {
 	var instanceTypes []*cloudprovider.InstanceType
 

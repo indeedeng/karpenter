@@ -68,4 +68,51 @@ var (
 			metrics.ReasonLabel,
 		},
 	)
+
+	// The gauges below carry series only for offerings and NodePools the tracker currently holds
+	// back. They are published by the launch backoff metrics controller, which rebuilds the whole
+	// set each pass so that a recovered offering's series disappears rather than pinning at 0.
+	// Deliberately not a duplicate of the provider's own per-offering availability signal: nothing
+	// is emitted for an offering that has never failed.
+
+	// OfferingsUnavailable answers "which capacity pools is Karpenter refusing to try", which the
+	// counter cannot, since a failure count does not say whether the block is still in force.
+	OfferingsUnavailable = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: offeringSubsystem,
+			Name:      "unavailable",
+			Help:      "Set to 1 while Karpenter is holding an offering out of scheduling after an insufficient capacity failure. Labeled by instance type, capacity type, and zone. No series is emitted for offerings that are currently usable.",
+		},
+		[]string{
+			metrics.InstanceTypeLabel,
+			metrics.CapacityTypeLabel,
+			metrics.ZoneLabel,
+		},
+	)
+	// NodePoolsLaunchConstrained is the "is this NodePool being throttled" signal. A released pool
+	// can still be throttling risky launches, which is why the throttled counter is by reason.
+	NodePoolsLaunchConstrained = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: metrics.NodePoolSubsystem,
+			Name:      "launch_constrained",
+			Help:      "Set to 1 while a nodepool's aggregate launch budget is engaged after an insufficient capacity failure. Labeled by nodepool. No series is emitted for nodepools launching freely.",
+		},
+		[]string{metrics.NodePoolLabel},
+	)
+	// NodePoolsLaunchBurst separates a pool that is recovering from one that keeps failing: the
+	// ceiling doubles per success and resets to the floor on failure.
+	NodePoolsLaunchBurst = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: metrics.NodePoolSubsystem,
+			Name:      "launch_burst",
+			Help:      "The number of launches a constrained nodepool is allowed per probe window at its current recovery level. Rises as launches succeed and resets to 1 on failure. Labeled by nodepool. No series is emitted for nodepools launching freely.",
+		},
+		[]string{metrics.NodePoolLabel},
+	)
 )

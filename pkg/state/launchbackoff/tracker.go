@@ -146,6 +146,44 @@ func (t *Tracker) Empty() bool {
 	return len(t.offerings) == 0
 }
 
+// UnavailableOfferings returns the keys currently inside a backoff window. Offerings whose
+// window has elapsed are omitted even though their history is still remembered, so the result is
+// "what is blocked right now" rather than "what has ever failed".
+//
+// A snapshot rather than a callback so that the caller never holds the lock while it builds
+// metric series, and cannot deadlock by calling back into the tracker.
+func (t *Tracker) UnavailableOfferings() []cloudprovider.OfferingKey {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	now := t.clock.Now()
+	keys := []cloudprovider.OfferingKey{}
+	for key := range t.offerings {
+		if e, ok := t.live(key, now); ok && now.Before(e.until) {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// ConstrainedPools returns the burst ceiling of every NodePool whose aggregate budget is engaged.
+//
+// The ceiling rather than the remaining allowance: remaining is consumed and refilled every
+// window, so graphing it would show a sawtooth and hide whether the pool is recovering (rising)
+// or stuck at the floor (pinned at 1).
+func (t *Tracker) ConstrainedPools() map[types.UID]int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	pools := map[types.UID]int{}
+	for uid, p := range t.pools {
+		if p.constrained {
+			pools[uid] = p.burst
+		}
+	}
+	return pools
+}
+
 // IsAvailable reports whether core will allow an attempt on this offering. True when the
 // offering has no history, when its history has expired, or when its window has elapsed.
 //

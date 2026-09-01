@@ -147,4 +147,8 @@ settings:
     # -- nodeRepair is ALPHA and is disabled by default.
     # Setting this to true will enable node repair.
     nodeRepair: false
+    # -- launchBackoff is ALPHA and is disabled by default.
+    # Setting this to true will back off launches into capacity pools that returned insufficient capacity,
+    # and bound how fast a NodePool retries after one.
+    launchBackoff: false
 
