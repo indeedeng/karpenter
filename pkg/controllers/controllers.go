@@ -144,14 +144,15 @@ func NewControllers(
 		controllers = append(controllers, deviceAllocationController)
 	}
 
+	if options.FromContext(ctx).FeatureGates.LaunchBackoff {
+		controllers = append(controllers, metricslaunchbackoff.NewController(kubeClient, launchBackoff))
+	}
+
 	if !options.FromContext(ctx).DisableClusterStateObservability {
 		controllers = append(controllers,
 			metricspod.NewController(kubeClient, cluster),
 			metricsnodepool.NewController(kubeClient, cloudProvider, clusterCost),
 			metricsnode.NewController(cluster),
-			// Registered unconditionally so that flipping the gate off clears the gauges rather than
-			// freezing them at their last value.
-			metricslaunchbackoff.NewController(kubeClient, launchBackoff),
 			status.NewController[*v1.NodeClaim](
 				kubeClient,
 				mgr.GetEventRecorderFor("karpenter"), //nolint:staticcheck // SA1019: will be replaced by mgr.GetEventRecorder once operatorpkg is updated

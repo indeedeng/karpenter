@@ -31,7 +31,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
-	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 )
 
@@ -66,13 +65,6 @@ func (c *Controller) Name() string {
 
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
-
-	// Tracker state can outlive a gate flip. Emitting from it would show a cluster as throttled
-	// after the feature was turned off, when nothing is actually being held back.
-	if !options.FromContext(ctx).FeatureGates.LaunchBackoff {
-		c.metricStore.ReplaceAll(nil)
-		return reconciler.Result{RequeueAfter: pollInterval}, nil
-	}
 
 	nodePoolNames, err := c.nodePoolNames(ctx)
 	if err != nil {
