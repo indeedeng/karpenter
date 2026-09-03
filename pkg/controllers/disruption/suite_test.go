@@ -58,6 +58,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
@@ -78,6 +79,7 @@ var nodeStateController *informer.NodeController
 var nodeClaimStateController *informer.NodeClaimController
 var recorder *test.EventRecorder
 var queue *disruption.Queue
+var launchBackoff *launchbackoff.Tracker
 var allKnownDisruptionReasons []v1.DisruptionReason
 
 var onDemandInstances []*cloudprovider.InstanceType
@@ -104,8 +106,9 @@ var _ = BeforeSuite(func() {
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
 	recorder = test.NewEventRecorder()
 	draController = deviceallocation.NewController(env.Client)
-	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client))
-	queue = disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov)
+	launchBackoff = launchbackoff.NewTracker(env.Clock)
+	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), launchBackoff)
+	queue = disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov, launchBackoff)
 })
 
 var _ = AfterSuite(func() {
@@ -124,13 +127,14 @@ var _ = BeforeEach(func() {
 	// (which the controller accumulates across reconciles and never resets) doesn't leak between specs. This must
 	// happen before the disruptionController and queue below, which capture prov. Mirrors the provisioning suite.
 	draController = deviceallocation.NewController(env.Client)
-	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client))
+	launchBackoff = launchbackoff.NewTracker(env.Clock)
+	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), launchBackoff)
 
 	// Ensure that we reset the disruption controller's methods after each test run
 	disruptionController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
 	env.Clock.SetTime(time.Now())
 	cluster.Reset()
-	*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))
+	*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov, launchBackoff))
 	cluster.MarkUnconsolidated()
 
 	// Reset Feature Flags to test defaults
@@ -177,6 +181,87 @@ var _ = AfterEach(func() {
 	// Reset the metrics collectors
 	disruption.DecisionsPerformedTotal.Reset()
 	disruption.NodepoolDecisionsPerformed.Reset()
+})
+
+var _ = Describe("Launch Backoff", func() {
+	var nodePool *v1.NodePool
+
+	BeforeEach(func() {
+		nodePool = test.NodePool()
+		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+			FeatureGates: test.FeatureGates{LaunchBackoff: lo.ToPtr(true)},
+		}))
+		// The assorted fixture the outer suite installs gives each type a single capacity pool,
+		// which cannot show that backing one off leaves the others alone. The default fake type
+		// spans several zones and both capacity types.
+		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{fake.NewInstanceType("test-instance-type")}
+		ExpectApplied(ctx, env.Client, nodePool)
+	})
+
+	// availablePools reports the capacity pools an instance type can still launch into, which is
+	// what a replacement gets simulated against.
+	availablePools := func(it *cloudprovider.InstanceType) []cloudprovider.OfferingKey {
+		return lo.Map(it.Offerings.Available(), func(o *cloudprovider.Offering, _ int) cloudprovider.OfferingKey {
+			return o.Key(it.Name)
+		})
+	}
+
+	// multiPoolInstanceType returns an instance type offering at least two pools, so a spec can back
+	// one off and still assert the others survive. Not every assorted fake type has more than one.
+	multiPoolInstanceType := func() *cloudprovider.InstanceType {
+		its, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+		Expect(err).To(Succeed())
+		it, ok := lo.Find(its, func(it *cloudprovider.InstanceType) bool {
+			return len(it.Offerings.Available()) >= 2
+		})
+		Expect(ok).To(BeTrue(), "no fake instance type offers two capacity pools")
+		return it
+	}
+
+	It("should mark a backed-off offering unavailable in the NodePool instance type map", func() {
+		it := multiPoolInstanceType()
+		backedOff := availablePools(it)[0]
+		launchBackoff.Fail(ctx, backedOff)
+
+		_, itMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider, launchBackoff)
+		Expect(err).To(Succeed())
+
+		Expect(itMap[nodePool.Name]).To(HaveKey(it.Name))
+		Expect(availablePools(itMap[nodePool.Name][it.Name])).ToNot(ContainElement(backedOff))
+	})
+	It("should not disturb the offerings of a pool that has not failed", func() {
+		it := multiPoolInstanceType()
+		pools := availablePools(it)
+		launchBackoff.Fail(ctx, pools[0])
+
+		_, itMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider, launchBackoff)
+		Expect(err).To(Succeed())
+
+		Expect(availablePools(itMap[nodePool.Name][it.Name])).To(ContainElement(pools[1]))
+	})
+	It("should leave the provider's cached instance types untouched", func() {
+		it := multiPoolInstanceType()
+		backedOff := availablePools(it)[0]
+		launchBackoff.Fail(ctx, backedOff)
+
+		_, _, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider, launchBackoff)
+		Expect(err).To(Succeed())
+
+		// Filtering copies. If it mutated in place, one NodePool's shortage would silently apply to
+		// every other pool sharing the provider's cache.
+		Expect(availablePools(multiPoolInstanceType())).To(ContainElement(backedOff))
+	})
+	It("should restore the offering once its window elapses", func() {
+		it := multiPoolInstanceType()
+		backedOff := availablePools(it)[0]
+		launchBackoff.Fail(ctx, backedOff)
+		env.Clock.Step(launchbackoff.BaseDelay + launchbackoff.MaxDelay)
+
+		_, itMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider, launchBackoff)
+		Expect(err).To(Succeed())
+
+		Expect(availablePools(itMap[nodePool.Name][it.Name])).To(ContainElement(backedOff))
+	})
 })
 
 var _ = Describe("Simulate Scheduling", func() {
@@ -230,7 +315,7 @@ var _ = Describe("Simulate Scheduling", func() {
 		ExpectApplied(ctx, env.Client, pod)
 		ExpectManualBinding(ctx, env.Client, pod, nodes[0])
 
-		nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider)
+		nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider, launchBackoff)
 		Expect(err).To(Succeed())
 
 		// Mark all nodeclaims as marked for deletion
@@ -472,8 +557,8 @@ var _ = Describe("Simulate Scheduling", func() {
 		hangCreateClient := newHangCreateClient(env.Client)
 		defer hangCreateClient.Stop()
 
-		p := provisioning.NewProvisioner(hangCreateClient, recorder, cloudProvider, cluster, env.Clock, deviceallocation.NewController(hangCreateClient), virtualpods.NewVirtualPodCache(hangCreateClient))
-		q := disruption.NewQueue(hangCreateClient, recorder, cluster, env.Clock, p)
+		p := provisioning.NewProvisioner(hangCreateClient, recorder, cloudProvider, cluster, env.Clock, deviceallocation.NewController(hangCreateClient), virtualpods.NewVirtualPodCache(hangCreateClient), launchBackoff)
+		q := disruption.NewQueue(hangCreateClient, recorder, cluster, env.Clock, p, launchBackoff)
 		dc := disruption.NewController(env.Clock, hangCreateClient, p, cloudProvider, recorder, cluster, q, clusterCost)
 
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{

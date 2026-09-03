@@ -77,6 +77,7 @@ const (
 	ResourceTypeLabel        = "resource_type"
 	CapacityTypeLabel        = "capacity_type"
 	ZoneLabel                = "zone"
+	InstanceTypeLabel        = "instance_type"
 	MinValuesRelaxedLabel    = "min_values_relaxed"
 	ConsolidationPolicyLabel = "consolidation_policy"
 	TerminationModeLabel     = "termination_mode"
@@ -136,6 +137,10 @@ var (
 	Zone = opmetrics.Label{
 		Name: ZoneLabel,
 		Help: "The availability zone of the instance.",
+	}
+	InstanceType = opmetrics.Label{
+		Name: InstanceTypeLabel,
+		Help: "The name of the instance type, as reported by the cloud provider.",
 	}
 	MinValuesRelaxed = opmetrics.Label{
 		Name:   MinValuesRelaxedLabel,

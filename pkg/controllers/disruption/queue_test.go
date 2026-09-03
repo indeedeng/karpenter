@@ -21,9 +21,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 
@@ -459,7 +462,7 @@ var _ = Describe("Queue", func() {
 		Context("CalculateRetryDuration", func() {
 			DescribeTable("should calculate correct timeout based on queue length",
 				func(numCommands int, expectedDuration time.Duration) {
-					q := disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov)
+					q := disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov, launchBackoff)
 					q.Lock()
 					for i := range numCommands {
 						q.ProviderIDToCommand[strconv.Itoa(i)] = &disruption.Command{}
@@ -475,6 +478,80 @@ var _ = Describe("Queue", func() {
 				Entry("very large queue - 80000 commands (capped)", 80000, 1*time.Hour),        // min(80000*80ms, 1hr) = 1hr
 				Entry("extremely large queue - 100000 commands (capped)", 100000, 1*time.Hour), // min(100000*80ms, 1hr) = 1hr
 			)
+		})
+		Context("Launch Backoff", func() {
+			var stateNode *state.StateNode
+			var replacement *disruption.Replacement
+
+			command := func() *disruption.Command {
+				return &disruption.Command{
+					Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+					CreationTimestamp: env.Clock.Now(),
+					ID:                uuid.New(),
+					Results:           scheduling.Results{},
+					Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+					Replacements:      []*disruption.Replacement{replacement},
+				}
+			}
+
+			BeforeEach(func() {
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+					FeatureGates: test.FeatureGates{LaunchBackoff: lo.ToPtr(true)},
+				}))
+				ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+				stateNode = ExpectStateNodeExists(cluster, node1)
+
+				// The UID the API server assigned is the key the tracker budgets by.
+				nodePool = ExpectExists(ctx, env.Client, nodePool)
+				nct := scheduling.NewNodeClaimTemplate(nodePool)
+				nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+				replacement = &disruption.Replacement{NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct}}
+			})
+			AfterEach(func() {
+				launchBackoff.Delete(nodePool.UID)
+			})
+
+			It("should start a command whose replacement nodepool has not failed", func() {
+				Expect(queue.StartCommand(ctx, command())).To(Succeed())
+			})
+			It("should refuse a command whose replacement nodepool is recovering", func() {
+				launchBackoff.FailPool(ctx, nodePool.UID)
+
+				Expect(queue.StartCommand(ctx, command())).To(MatchError(ContainSubstring("recovering from insufficient capacity")))
+			})
+			It("should not mark the candidate disrupted when it refuses", func() {
+				// The refusal has to land before markDisrupted, or a command that never runs still
+				// leaves its candidates cordoned and condition-marked.
+				launchBackoff.FailPool(ctx, nodePool.UID)
+
+				Expect(queue.StartCommand(ctx, command())).ToNot(Succeed())
+
+				disrupted := ExpectExists(ctx, env.Client, nodeClaim1).StatusConditions().Get(v1.ConditionTypeDisruptionReason)
+				Expect(disrupted.IsTrue()).To(BeFalse())
+			})
+			It("should not consume the probe that pending pods are waiting on", func() {
+				// A peek, not an admission. Spending the probe here is what starves provisioning.
+				launchBackoff.FailPool(ctx, nodePool.UID)
+
+				Expect(queue.StartCommand(ctx, command())).ToNot(Succeed())
+
+				Expect(launchBackoff.Admit(ctx, nodePool.UID, false)).To(BeTrue())
+			})
+			It("should start a pure deletion regardless of the nodepool being constrained", func() {
+				// Deleting frees capacity rather than asking for it, so there is nothing to throttle.
+				launchBackoff.FailPool(ctx, nodePool.UID)
+				cmd := command()
+				cmd.Replacements = nil
+
+				Expect(queue.StartCommand(ctx, cmd)).To(Succeed())
+			})
+			It("should start the command while the gate is disabled", func() {
+				launchBackoff.FailPool(ctx, nodePool.UID)
+				ctx = options.ToContext(ctx, test.Options())
+
+				Expect(queue.StartCommand(ctx, command())).To(Succeed())
+			})
 		})
 	})
 })

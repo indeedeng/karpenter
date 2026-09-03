@@ -55,6 +55,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -102,11 +103,12 @@ type Queue struct {
 	cluster             *state.Cluster
 	clock               clock.Clock
 	provisioner         *provisioning.Provisioner
+	launchBackoff       *launchbackoff.Tracker
 }
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
 func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock,
-	provisioner *provisioning.Provisioner,
+	provisioner *provisioning.Provisioner, launchBackoff *launchbackoff.Tracker,
 ) *Queue {
 	queue := &Queue{
 		// nolint:staticcheck
@@ -118,6 +120,7 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 		cluster:             cluster,
 		clock:               clock,
 		provisioner:         provisioner,
+		launchBackoff:       launchBackoff,
 	}
 	return queue
 }
@@ -325,6 +328,17 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	})
 	if q.HasAny(providerIDs...) {
 		return fmt.Errorf("candidate is being disrupted")
+	}
+	// Checked before anything is cordoned. Disruption is discretionary: replacing a healthy node from
+	// a NodePool that just failed to launch spends a probe that pending pods need more, and leaves a
+	// cordoned node behind if the replacement then fails too. All-or-nothing across replacement pools
+	// because a partially launched command still deletes every candidate.
+	//
+	// A peek, not an Admit: consuming the probe here is what would starve provisioning.
+	if constrained, ok := lo.Find(cmd.Replacements, func(r *Replacement) bool {
+		return q.launchBackoff.IsConstrained(ctx, r.NodePoolUUID)
+	}); ok {
+		return serrors.Wrap(fmt.Errorf("nodepool is recovering from insufficient capacity"), "NodePool", klog.KRef("", constrained.NodePoolName))
 	}
 
 	log.FromContext(ctx).WithValues(append([]any{

@@ -58,6 +58,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -92,11 +93,13 @@ type Provisioner struct {
 	clock                      clock.Clock
 	deviceAllocationController *deviceallocation.Controller
 	virtualPodCache            *virtualpods.Cache
+	launchBackoff              *launchbackoff.Tracker
 }
 
 func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 	cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster,
 	clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache,
+	launchBackoff *launchbackoff.Tracker,
 ) *Provisioner {
 	p := &Provisioner{
 		batcher:                    NewBatcher[types.UID](clock),
@@ -109,6 +112,7 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 		clock:                      clock,
 		deviceAllocationController: deviceAllocationController,
 		virtualPodCache:            virtualPodCache,
+		launchBackoff:              launchBackoff,
 	}
 	return p
 }
@@ -130,6 +134,11 @@ func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
 
 func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, err error) {
 	ctx = injection.WithControllerName(ctx, p.Name())
+
+	// Reclaim launch backoff state that has gone quiet. This rides the provisioning loop rather
+	// than a controller of its own because it is a small map sweep and this is the only
+	// singleton that already runs on the cadence the backoff windows are measured in.
+	p.launchBackoff.GC()
 
 	// Batch pods
 	if triggered := p.batcher.Wait(ctx); !triggered {
@@ -162,10 +171,60 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 	if len(results.NewNodeClaims) == 0 {
 		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 	}
-	if _, err = p.CreateNodeClaims(ctx, results.NewNodeClaims, WithReason(metrics.ProvisionedReason), RecordPodNomination); err != nil {
+	// Consumed here rather than inside CreateNodeClaims: that function is shared with the disruption
+	// queue, which requires len(names) == len(replacements) after its candidates may already be
+	// cordoned, so it must never silently omit.
+	//
+	// Omitted NodeClaims need no requeue of their own. Their pods stay provisionable, and the pod
+	// controller re-triggers this loop every 10s — sooner than any backoff window elapses.
+	admitted := p.admit(ctx, results.NewNodeClaims)
+	if len(admitted) == 0 {
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+	}
+	if _, err = p.CreateNodeClaims(ctx, admitted, WithReason(metrics.ProvisionedReason), RecordPodNomination); err != nil {
 		return reconciler.Result{}, err
 	}
 	return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+}
+
+// admit returns the NodeClaims the per-NodePool launch budgets allow this round.
+//
+// Non-risky NodeClaims are offered first. A NodeClaim with at least one offering that has not failed
+// recently should not queue behind probes for pools already known to be short, otherwise a shortage
+// in one zone throttles the launches that would have succeeded in another. The same walk supplies
+// both the ordering and the risky argument, so there is no second pass, and it is skipped entirely
+// when the tracker holds no offering state.
+func (p *Provisioner) admit(ctx context.Context, nodeClaims []*scheduler.NodeClaim) []*scheduler.NodeClaim {
+	risky := make([]bool, len(nodeClaims))
+	order := make([]int, 0, len(nodeClaims))
+	for i, nc := range nodeClaims {
+		risky[i] = p.launchBackoff.IsRisky(ctx, nc.InstanceTypeOptions)
+		if !risky[i] {
+			order = append(order, i)
+		}
+	}
+	for i := range nodeClaims {
+		if risky[i] {
+			order = append(order, i)
+		}
+	}
+	admitted := make([]*scheduler.NodeClaim, 0, len(nodeClaims))
+	for _, i := range order {
+		if p.launchBackoff.Admit(ctx, nodeClaims[i].NodePoolUUID, risky[i]) {
+			admitted = append(admitted, nodeClaims[i])
+			continue
+		}
+		// A risky NodeClaim on a constrained pool has to clear both gates, so a refusal cannot be
+		// attributed to one of them. Report the pool being constrained in that case, since that is
+		// the condition an operator would act on; a bare risky refusal means the pool has recovered
+		// and only the probe rate is holding this launch back.
+		launchbackoff.NodePoolsLaunchThrottledTotal.Inc(map[string]string{
+			metrics.NodePoolLabel: nodeClaims[i].NodePoolName,
+			metrics.ReasonLabel: lo.Ternary(p.launchBackoff.IsConstrained(ctx, nodeClaims[i].NodePoolUUID),
+				launchbackoff.ThrottledReasonConstrained, launchbackoff.ThrottledReasonRisky),
+		})
+	}
+	return admitted
 }
 
 // CreateNodeClaims launches nodes passed into the function in parallel. It returns a slice of the successfully created node
@@ -310,7 +369,11 @@ func (p *Provisioner) NewScheduler(
 			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, no resolved instance types found")
 			continue
 		}
-		instanceTypes[np.Name] = its
+		// Must happen before these reach NewTopology or the scheduler, both of which trigger the
+		// InstanceType precompute. FilterUnavailable copies the affected types, so the copy
+		// precomputes against the cleared Available flags rather than inheriting the provider's
+		// cached view.
+		instanceTypes[np.Name] = launchbackoff.FilterUnavailable(ctx, its, p.launchBackoff)
 	}
 
 	// Get volume topology requirements WITHOUT modifying pods.

@@ -47,9 +47,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
 
@@ -75,6 +77,7 @@ var (
 	nodeClaimStateController *informer.NodeClaimController
 	prov                     *provisioning.Provisioner
 	clusterCost              *cost.ClusterCost
+	launchBackoff            *launchbackoff.Tracker
 )
 
 func TestAPIs(t *testing.T) {
@@ -88,12 +91,13 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	virtualPodCache := virtualpods.NewVirtualPodCache(env.Client)
-	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualPodCache)
+	launchBackoff = launchbackoff.NewTracker(env.Clock)
+	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualPodCache, launchBackoff)
 	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)
 	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
 	nodeController = informer.NewNodeController(env.Client, cluster)
 	daemonsetController = informer.NewDaemonSetController(env.Client, cluster)
-	controller = static.NewController(env.Client, cluster, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Client), virtualPodCache)
+	controller = static.NewController(env.Client, cluster, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Client), virtualPodCache, launchBackoff)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
 })
 
@@ -127,7 +131,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			ExpectApplied(ctx, env.Client, nodePool)
 
 			// Create controller with failing client
-			failingController := static.NewController(&failingClient{Client: env.Client}, cluster, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client))
+			failingController := static.NewController(&failingClient{Client: env.Client}, cluster, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), launchBackoff)
 
 			result, err := failingController.Reconcile(ctx, nodePool)
 			Expect(err).To(HaveOccurred())
@@ -613,5 +617,68 @@ var _ = Describe("Static Provisioning Controller", func() {
 			Entry("replica same, both true", new(int64(5)), new(int64(5)), true, true, false),
 			Entry("replica same, both false", new(int64(5)), new(int64(5)), false, false, false),
 		)
+	})
+
+	Context("Launch Backoff", func() {
+		var nodePool *v1.NodePool
+
+		BeforeEach(func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+				FeatureGates: test.FeatureGates{LaunchBackoff: lo.ToPtr(true)},
+			}))
+			nodePool = test.StaticNodePool()
+			nodePool.Spec.Replicas = new(int64(5))
+			ExpectApplied(ctx, env.Client, nodePool)
+		})
+		AfterEach(func() {
+			launchBackoff.Delete(nodePool.UID)
+		})
+
+		It("should provision the full replica count when the nodepool has not failed", func() {
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(5))
+		})
+		It("should withhold replicas beyond the probe allowance after an insufficient capacity failure", func() {
+			launchBackoff.FailPool(ctx, nodePool.UID)
+
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+		})
+		It("should requeue for the next probe rather than the steady-state minute", func() {
+			// Nothing else wakes this controller while a replica count goes unmet, so the wait has to
+			// track the budget window and not the polling interval.
+			launchBackoff.FailPool(ctx, nodePool.UID)
+
+			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+
+			Expect(result.RequeueAfter).To(BeNumerically("<=", launchbackoff.ProbeInterval))
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		})
+		It("should release the node count it reserved for withheld replicas", func() {
+			// CreateNodeClaims only releases what it is handed. A leaked reservation would count
+			// against the NodePool's node limit until the process restarts.
+			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("5")}
+			ExpectApplied(ctx, env.Client, nodePool)
+			launchBackoff.FailPool(ctx, nodePool.UID)
+
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			ExpectDeleted(ctx, env.Client, ExpectNodeClaims(ctx, env.Client)[0])
+			cluster.Reset()
+
+			// A leak would leave fewer than 5 available on the retry.
+			launchBackoff.Delete(nodePool.UID)
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(5))
+		})
+		It("should provision the full replica count while the gate is disabled", func() {
+			ctx = options.ToContext(ctx, test.Options())
+			launchBackoff.FailPool(ctx, nodePool.UID)
+
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(5))
+		})
 	})
 })
