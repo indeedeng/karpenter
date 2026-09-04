@@ -770,7 +770,17 @@ not duplicate the provider's per-offering availability gauge for healthy offerin
 | `karpenter_offerings_unavailable` | gauge 0/1, by `instance_type`, `capacity_type`, `zone` | 1 while `!IsAvailable(key)` for a tracker entry. Deleted when the entry is reset on success **or expires** at `until + maxDelay`, so the series set really is "currently backed-off offerings" rather than every offering that has ever failed. |
 | `karpenter_nodepools_launch_constrained` | gauge 0/1, by `nodepool` | 1 while the pool's aggregate budget is constrained. The "is this NodePool being throttled" signal. Note a released pool can still be throttling risky launches, which is why the counter below is labelled by reason. |
 | `karpenter_nodepools_launch_burst` | gauge, by `nodepool` | The `burst` *ceiling* at the current recovery level — not `remaining`. Deleted when the pool is released. Distinguishes "recovering" (rising) from "stuck at the floor" (pinned at 1); graphing consumption here instead would show a per-window sawtooth and hide the ramp. |
-| `karpenter_nodepools_launch_throttled_total` | counter, by `nodepool`, `reason` (`constrained`, `risky`) | Incremented by the `Admit` caller (`Provisioner.Reconcile` or `static.provisioning`) once per NodeClaim not created because `Admit` returned false. Distinguishes "throttled" from "nothing to do," and aggregate throttling from risky-probe throttling on a released pool. Not incremented from `CreateNodeClaims`. |
+| `karpenter_nodepools_launch_throttled_total` | counter, by `nodepool`, `reason` (`constrained`, `risky`), `capacity_type` | Incremented by the `Admit` caller (`Provisioner.Reconcile` or `static.provisioning`) once per NodeClaim not created because `Admit` returned false. Distinguishes "throttled" from "nothing to do," and aggregate throttling from risky-probe throttling on a released pool. Not incremented from `CreateNodeClaims`. `capacity_type` is what the NodeClaim could still have launched into: a concrete type once the offering filter has narrowed it to one, `mixed` while several remain, empty on the static path, which never resolves one. |
+
+`capacity_type` on the throttled counter is what makes the cost of NodePool keying measurable
+rather than merely arguable. The budget is keyed by NodePool but the offerings that engage it
+are not, so in a NodePool accepting both spot and on-demand a spot shortage can constrain the
+pool and then throttle a NodeClaim the offering filter has already narrowed to on-demand — a
+launch the backoff had already made safe. Joined against
+`karpenter_offerings_launch_failures_total{capacity_type}`, this label answers directly whether
+that collateral throttling is a real share of the total or a rounding error, which is the
+evidence [Why the budget is keyed by NodePool](#per-nodepool-launch-budget) needs and the
+question a per-offering budget would be adopted to solve.
 
 The primary success metric needs no new instrumentation: the ratio of
 `karpenter_nodeclaims_disrupted_total{reason=insufficient_capacity}` to

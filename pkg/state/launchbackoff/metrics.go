@@ -32,7 +32,26 @@ const (
 	// not distinguish "this pool is being held back" from "this launch had nowhere untried to go".
 	ThrottledReasonConstrained = "constrained"
 	ThrottledReasonRisky       = "risky"
+
+	// ThrottledCapacityTypeMixed marks a throttled NodeClaim that could still have landed on more
+	// than one capacity type, so the throttle cannot be charged to any single one.
+	ThrottledCapacityTypeMixed = "mixed"
 )
+
+// ThrottledCapacityType collapses the capacity types a throttled NodeClaim could still have
+// launched into down to one label value: the type itself once only one remains, which is the case
+// the offering filter produces when it withdraws the alternatives; ThrottledCapacityTypeMixed
+// while the choice is still open; and empty where the launch path never resolves one.
+func ThrottledCapacityType(available []string) string {
+	switch len(available) {
+	case 0:
+		return ""
+	case 1:
+		return available[0]
+	default:
+		return ThrottledCapacityTypeMixed
+	}
+}
 
 var (
 	// OfferingsLaunchFailuresTotal records where capacity was short, which the existing
@@ -55,17 +74,25 @@ var (
 	// NodePoolsLaunchThrottledTotal counts NodeClaims a launch budget declined. This is what
 	// separates "Karpenter is holding back" from "there was nothing to do", which is otherwise
 	// indistinguishable from the outside.
+	//
+	// Capacity type is on it because the pool budget is keyed by NodePool while the offerings that
+	// provoke it are not. In a NodePool accepting both spot and on-demand, a spot shortage can
+	// engage the budget and then throttle a NodeClaim the offering filter has already narrowed to
+	// on-demand. Without this label a throttle cannot be told apart from one holding back a launch
+	// into the pool that is actually short, which is the measurement the NodePool-versus-offering
+	// keying question turns on.
 	NodePoolsLaunchThrottledTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
 			Namespace: metrics.Namespace,
 			Subsystem: metrics.NodePoolSubsystem,
 			Name:      "launch_throttled_total",
-			Help:      "Number of nodeclaims not created because a launch budget declined them after an insufficient capacity failure. Labeled by the owning nodepool and which budget declined.",
+			Help:      "Number of nodeclaims not created because a launch budget declined them after an insufficient capacity failure. Labeled by the owning nodepool, which budget declined, and the capacity type the nodeclaim could still have launched into: a concrete type once the offering filter has narrowed it to one, \"mixed\" while several remain, and empty where the launch path does not resolve one.",
 		},
 		[]string{
 			metrics.NodePoolLabel,
 			metrics.ReasonLabel,
+			metrics.CapacityTypeLabel,
 		},
 	)
 
