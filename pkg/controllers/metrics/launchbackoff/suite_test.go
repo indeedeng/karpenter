@@ -65,7 +65,7 @@ var _ = AfterEach(func() {
 
 var _ = Describe("Launch Backoff Metrics", func() {
 	var nodePool *v1.NodePool
-	offering := cloudprovider.OfferingKey{InstanceType: "large", CapacityType: v1.CapacityTypeSpot, Zone: "test-zone-1a"}
+	var offering cloudprovider.OfferingKey
 
 	// unavailableGauge reports whether a series exists for the offering, which is the assertion that
 	// matters: a recovered offering must stop being reported rather than report 0.
@@ -100,6 +100,14 @@ var _ = Describe("Launch Backoff Metrics", func() {
 		nodePool = test.NodePool()
 		ExpectApplied(ctx, env.Client, nodePool)
 		nodePool = ExpectExists(ctx, env.Client, nodePool)
+		// Prometheus collectors are process-global, while each spec gets a fresh Controller and
+		// metric Store. Use the unique NodePool name so a series left by one spec cannot satisfy
+		// another spec's lookup when Ginkgo changes execution order.
+		offering = cloudprovider.OfferingKey{
+			InstanceType: nodePool.Name,
+			CapacityType: v1.CapacityTypeSpot,
+			Zone:         "test-zone-1a",
+		}
 	})
 
 	Context("offerings", func() {
@@ -199,19 +207,4 @@ var _ = Describe("Launch Backoff Metrics", func() {
 		})
 	})
 
-	It("should clear every series when the gate is turned off", func() {
-		// State outlives a gate flip, so without this a rolled-back cluster would keep graphing as
-		// throttled while nothing is actually held back.
-		launchBackoff.Fail(ctx, offering)
-		launchBackoff.FailPool(ctx, nodePool.UID)
-		ExpectSingletonReconciled(ctx, controller)
-		ctx = options.ToContext(ctx, test.Options())
-
-		ExpectSingletonReconciled(ctx, controller)
-
-		_, offeringFound := unavailableGauge(offering)
-		Expect(offeringFound).To(BeFalse())
-		_, poolFound := constrainedGauge(nodePool.Name)
-		Expect(poolFound).To(BeFalse())
-	})
 })

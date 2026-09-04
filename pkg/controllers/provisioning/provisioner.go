@@ -218,6 +218,7 @@ func (p *Provisioner) admit(ctx context.Context, nodeClaims []*scheduler.NodeCla
 			metrics.NodePoolLabel: nodeClaims[i].NodePoolName,
 			metrics.ReasonLabel: lo.Ternary(p.launchBackoff.IsConstrained(ctx, nodeClaims[i].NodePoolUUID),
 				launchbackoff.ThrottledReasonConstrained, launchbackoff.ThrottledReasonRisky),
+			metrics.CapacityTypeLabel: launchbackoff.ThrottledCapacityType(nodeClaims[i].CapacityTypesAvailable()),
 		})
 	}
 	return admitted

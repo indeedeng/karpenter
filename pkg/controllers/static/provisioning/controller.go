@@ -151,9 +151,13 @@ func (c *Controller) admitReplicas(ctx context.Context, np *v1.NodePool, wanted 
 		// CreateNodeClaims releases a reservation per NodeClaim it is handed, so the ones we withhold
 		// have to be released here or the limit stays consumed until the process restarts.
 		c.cluster.NodePoolState.ReleaseNodeCount(np.Name, throttled)
+		// Capacity type is left empty rather than resolved: static NodeClaims skip the instance type
+		// and capacity type narrowing in ToNodeClaim entirely, so the cloud provider still chooses,
+		// and these replicas are withheld before any NodeClaim is built to ask.
 		launchbackoff.NodePoolsLaunchThrottledTotal.Add(float64(throttled), map[string]string{
-			metrics.NodePoolLabel: np.Name,
-			metrics.ReasonLabel:   launchbackoff.ThrottledReasonConstrained,
+			metrics.NodePoolLabel:     np.Name,
+			metrics.ReasonLabel:       launchbackoff.ThrottledReasonConstrained,
+			metrics.CapacityTypeLabel: "",
 		})
 		log.FromContext(ctx).WithValues("throttled-count", throttled, "provision-count", admitted).
 			Info("withholding nodeclaims after insufficient capacity")
