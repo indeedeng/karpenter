@@ -97,7 +97,7 @@ var _ = Describe("Launch Admission", func() {
 	// Read from the registry directly: pkg/test/expectations imports this package, so the usual
 	// metric helpers would be an import cycle. Counters persist across specs, so callers compare
 	// against a value captured before the call under test.
-	throttled := func(nodePool types.UID, capacityType string) float64 {
+	throttled := func(nodePool types.UID, reason, capacityType string) float64 {
 		families, err := crmetrics.Registry.Gather()
 		Expect(err).ToNot(HaveOccurred())
 		for _, mf := range families {
@@ -109,7 +109,9 @@ var _ = Describe("Launch Admission", func() {
 				for _, l := range m.GetLabel() {
 					labels[l.GetName()] = l.GetValue()
 				}
-				if labels["nodepool"] == string(nodePool) && labels["capacity_type"] == capacityType {
+				if labels["nodepool"] == string(nodePool) &&
+					labels["reason"] == reason &&
+					labels["capacity_type"] == capacityType {
 					return m.GetCounter().GetValue()
 				}
 			}
@@ -185,19 +187,19 @@ var _ = Describe("Launch Admission", func() {
 		// the pool, and the launch actually being held back is an on-demand one the offering filter
 		// had already steered to safety.
 		tracker.FailPool(gated, poolA)
-		before := throttled(poolA, v1.CapacityTypeOnDemand)
+		before := throttled(poolA, launchbackoff.ThrottledReasonConstrained, v1.CapacityTypeOnDemand)
 
 		Expect(provisioner.admit(gated, []*scheduler.NodeClaim{spotWithdrawn(poolA), spotWithdrawn(poolA)})).To(HaveLen(1))
 
-		Expect(throttled(poolA, v1.CapacityTypeOnDemand) - before).To(Equal(float64(1)))
+		Expect(throttled(poolA, launchbackoff.ThrottledReasonConstrained, v1.CapacityTypeOnDemand) - before).To(Equal(float64(1)))
 	})
 	It("should report a throttle as mixed while both capacity types remain usable", func() {
 		tracker.FailPool(gated, poolA)
-		before := throttled(poolA, launchbackoff.ThrottledCapacityTypeMixed)
+		before := throttled(poolA, launchbackoff.ThrottledReasonConstrained, launchbackoff.ThrottledCapacityTypeMixed)
 
 		Expect(provisioner.admit(gated, []*scheduler.NodeClaim{nodeClaim(poolA), nodeClaim(poolA)})).To(HaveLen(1))
 
-		Expect(throttled(poolA, launchbackoff.ThrottledCapacityTypeMixed) - before).To(Equal(float64(1)))
+		Expect(throttled(poolA, launchbackoff.ThrottledReasonConstrained, launchbackoff.ThrottledCapacityTypeMixed) - before).To(Equal(float64(1)))
 	})
 	It("should admit everything while the gate is disabled", func() {
 		tracker.FailPool(gated, poolA)
