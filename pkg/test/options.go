@@ -66,6 +66,7 @@ type FeatureGates struct {
 	PodDeletionCostManagement *bool
 	NodePoolDriftBackoff      *bool
 	LaunchBackoff             *bool
+	DriftReplacementBatching  *bool
 }
 
 func Options(overrides ...OptionsFields) *options.Options {
@@ -110,6 +111,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 			PodDeletionCostManagement: lo.FromPtrOr(opts.FeatureGates.PodDeletionCostManagement, options.PodDeletionCostManagementFeatureGate.Default),
 			NodePoolDriftBackoff:      lo.FromPtrOr(opts.FeatureGates.NodePoolDriftBackoff, options.NodePoolDriftBackoffFeatureGate.Default),
 			LaunchBackoff:             lo.FromPtrOr(opts.FeatureGates.LaunchBackoff, options.LaunchBackoffFeatureGate.Default),
+			DriftReplacementBatching:  lo.FromPtrOr(opts.FeatureGates.DriftReplacementBatching, options.DriftReplacementBatchingFeatureGate.Default),
 		},
 	}
 }

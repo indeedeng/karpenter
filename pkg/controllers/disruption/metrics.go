@@ -141,6 +141,30 @@ var (
 		[]opmetrics.Label{metrics.DisruptionReason, ConsolidationType},
 		opmetrics.Beta,
 	)
+	CandidateDiscoveryDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "candidate_discovery_duration_seconds",
+			Help:      "Duration of dynamic drift candidate discovery in seconds.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]opmetrics.Label{metrics.DisruptionReason, ConsolidationType},
+		opmetrics.Alpha,
+	)
+	DriftReplacementSimulationDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "drift_replacement_simulation_duration_seconds",
+			Help:      "Duration of each complete drift replacement simulation, including scheduler construction and solving.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
 	DecisionsPerformedTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{

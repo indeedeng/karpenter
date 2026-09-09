@@ -34,6 +34,7 @@ import (
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
@@ -101,6 +102,9 @@ type options struct {
 	// disruption candidate will free when it is terminated. Used by the terminate-first "would the pods fit once the
 	// slot is freed?" pass.
 	creditReservationCapacity map[string]int
+	replacementOnly           bool
+	batchLedger               *BatchLedger
+	additionalExcludedPods    []*corev1.Pod
 }
 
 type Options = option.Function[options]
@@ -148,6 +152,24 @@ var enforceConsolidateAfterEnabled = sync.OnceValue(func() bool {
 
 var IsConsolidationSimulation = func(opts *options) {
 	opts.enforceConsolidateAfter = enforceConsolidateAfterEnabled()
+}
+
+// ReplacementOnlySimulation prevents pods from scheduling onto existing cluster nodes.
+// Pods may still bin-pack onto NodeClaims created within this scheduler solve.
+var ReplacementOnlySimulation = func(opts *options) {
+	opts.replacementOnly = true
+}
+
+func WithBatchLedger(ledger *BatchLedger) Options {
+	return func(opts *options) {
+		opts.batchLedger = ledger
+	}
+}
+
+func WithAdditionalExcludedPods(pods ...*corev1.Pod) Options {
+	return func(opts *options) {
+		opts.additionalExcludedPods = pods
+	}
 }
 
 func NewScheduler(
@@ -233,6 +255,10 @@ func NewScheduler(
 		allocator:                 allocator,
 		instanceTypes:             instanceTypes,
 		cachedResourceClaims:      map[types.NamespacedName]*resourcev1.ResourceClaim{},
+		replacementOnly:           resolved.replacementOnly,
+	}
+	if resolved.batchLedger != nil {
+		s.reservationManager = resolved.batchLedger.reservationManagerFor(instanceTypes)
 	}
 
 	npByName := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
@@ -252,6 +278,9 @@ func NewScheduler(
 	}
 	s.deletingNodeNames = deletingNodeNames
 	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, resolved.enforceConsolidateAfter)
+	if resolved.batchLedger != nil {
+		resolved.batchLedger.seedScheduler(s)
+	}
 	return s
 }
 
@@ -296,6 +325,7 @@ type Scheduler struct {
 	minValuesPolicy           karpopts.MinValuesPolicy
 	numConcurrentReconciles   int
 	deletingNodeNames         sets.Set[string]
+	replacementOnly           bool
 
 	// allocator simulates DRA device allocation for pods with ResourceClaims. It is nil when DRA support is disabled.
 	allocator *dynamicresources.Allocator
@@ -648,9 +678,12 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 	if err != nil {
 		return err
 	}
-	// first try to schedule against an in-flight real node
-	if err := s.addToExistingNode(ctx, pod, volumes); err == nil {
-		return nil
+	// Replacement simulations retain existing nodes for accounting but never use them as destinations.
+	if !s.replacementOnly {
+		// first try to schedule against an in-flight real node
+		if err := s.addToExistingNode(ctx, pod, volumes); err == nil {
+			return nil
+		}
 	}
 	// Consider using https://pkg.go.dev/container/heap
 	sort.Slice(s.newNodeClaims, func(a, b int) bool { return len(s.newNodeClaims[a].Pods) < len(s.newNodeClaims[b].Pods) })
@@ -862,11 +895,14 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod, volu
 func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod, nodePoolMap map[string]*v1.NodePool, enforceConsolidateAfter bool) {
 	// create our existing nodes
 	for _, node := range stateNodes {
+		s.updateRemainingResources(node)
+		if s.replacementOnly {
+			continue
+		}
 		taints := node.Taints()
 		daemons := s.getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
 		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Name()], node.NodeClaim, s.clock)
 		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...), s.instanceTypeForNode(node), isUnderConsolidateAfter))
-		s.updateRemainingResources(node)
 	}
 	s.sortExistingNodes()
 }
@@ -1121,18 +1157,24 @@ func subtractMax(remaining corev1.ResourceList, instanceTypes []*cloudprovider.I
 	if len(instanceTypes) == 0 {
 		return remaining
 	}
-	var allInstanceResources []corev1.ResourceList
-	for _, it := range instanceTypes {
-		allInstanceResources = append(allInstanceResources, it.Capacity)
-	}
+	itResources := maxInstanceResources(instanceTypes)
 	result := corev1.ResourceList{}
-	itResources := resources.MaxResources(allInstanceResources...)
 	for k, v := range remaining {
 		cp := v.DeepCopy()
 		cp.Sub(itResources[k])
 		result[k] = cp
 	}
 	return result
+}
+
+func maxInstanceResources(instanceTypes []*cloudprovider.InstanceType) corev1.ResourceList {
+	var allInstanceResources []corev1.ResourceList
+	for _, it := range instanceTypes {
+		allInstanceResources = append(allInstanceResources, it.Capacity)
+	}
+	itResources := resources.MaxResources(allInstanceResources...)
+	itResources[resources.Node] = resource.MustParse("1")
+	return itResources
 }
 
 // filterByRemainingResources is used to filter out instance types that if launched would exceed the nodepool limits

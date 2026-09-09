@@ -298,6 +298,15 @@ func (c *Cluster) RepairPolicyMatcher() *health.RepairPolicyMatcher {
 	return c.repairPolicyMatcher
 }
 
+// IsNodeActive reports whether a node still exists in cluster state and is not deleting or
+// marked for deletion.
+func (c *Cluster) IsNodeActive(providerID string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	node, ok := c.nodes[providerID]
+	return ok && !node.MarkedForDeletion()
+}
+
 // IsNodeNominated returns true if the given node was expected to have a pod bound to it during a recent scheduling
 // batch
 func (c *Cluster) IsNodeNominated(providerID string) bool {

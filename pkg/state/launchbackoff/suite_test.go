@@ -455,6 +455,71 @@ var _ = Describe("CandidateOfferings", func() {
 	})
 })
 
+var _ = Describe("Preview", func() {
+	spotA := key("large", v1.CapacityTypeSpot, "zone-a")
+	spotB := key("large", v1.CapacityTypeSpot, "zone-b")
+	untracked := key("small", v1.CapacityTypeSpot, "zone-a")
+
+	It("admits everything when no offerings are tracked", func() {
+		Expect(tracker.Preview().AdmitBatch([][]cloudprovider.OfferingKey{{spotA}, {}})).To(BeTrue())
+	})
+
+	It("lets only one batch spend a single refill", func() {
+		tracker.Fail(ctx, "failure", spotA)
+		fakeClock.Step(launchbackoff.ProbeInterval)
+
+		preview := tracker.Preview()
+		Expect(preview.AdmitBatch([][]cloudprovider.OfferingKey{{spotA}})).To(BeTrue())
+		Expect(preview.AdmitBatch([][]cloudprovider.OfferingKey{{spotA}})).To(BeFalse())
+	})
+
+	It("rejects offerings still waiting for a refill and admits untracked alternatives", func() {
+		tracker.Fail(ctx, "failure", spotA)
+
+		preview := tracker.Preview()
+		Expect(preview.AdmitBatch([][]cloudprovider.OfferingKey{{spotA}})).To(BeFalse())
+		Expect(preview.AdmitBatch([][]cloudprovider.OfferingKey{{spotA, untracked}})).To(BeTrue())
+	})
+
+	It("rolls back debits from a batch that is not fully admitted", func() {
+		tracker.Fail(ctx, "failure", spotA, spotB)
+		fakeClock.Step(launchbackoff.ProbeInterval)
+
+		preview := tracker.Preview()
+		Expect(preview.AdmitBatch([][]cloudprovider.OfferingKey{{spotA}, {spotA}})).To(BeFalse())
+		Expect(preview.AdmitBatch([][]cloudprovider.OfferingKey{{spotA}, {spotB}})).To(BeTrue())
+	})
+
+	It("does not hold or consume tracker budget", func() {
+		tracker.Fail(ctx, "failure", spotA)
+		fakeClock.Step(launchbackoff.ProbeInterval)
+
+		Expect(tracker.Preview().AdmitBatch([][]cloudprovider.OfferingKey{{spotA}})).To(BeTrue())
+		Expect(tracker.Reserve(ctx, "reservation", []cloudprovider.OfferingKey{spotA}).Admitted).To(BeTrue())
+	})
+
+	It("agrees with ReserveBatch on which batches are admitted", func() {
+		tracker.Fail(ctx, "failure", spotA, spotB)
+		fakeClock.Step(launchbackoff.ProbeInterval)
+
+		preview := tracker.Preview()
+		batches := []map[string][]cloudprovider.OfferingKey{
+			{"a": {spotA, spotB}, "b": {spotA}},
+			{"c": {spotB}},
+			{"d": {spotA, spotB}},
+		}
+		for _, batch := range batches {
+			requests := make([][]cloudprovider.OfferingKey, 0, len(batch))
+			for _, keys := range batch {
+				requests = append(requests, keys)
+			}
+			predicted := preview.AdmitBatch(requests)
+			_, admitted := tracker.ReserveBatch(ctx, batch)
+			Expect(predicted).To(Equal(admitted))
+		}
+	})
+})
+
 var _ = Describe("Concurrency", func() {
 	spotA := key("large", v1.CapacityTypeSpot, "zone-a")
 
