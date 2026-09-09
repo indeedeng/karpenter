@@ -17,6 +17,8 @@ limitations under the License.
 package daemonset
 
 import (
+	"maps"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +32,7 @@ func PodForDaemonSet(daemonSet *appsv1.DaemonSet) *corev1.Pod {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      daemonSet.Name,
 			Namespace: daemonSet.Namespace,
+			Labels:    maps.Clone(daemonSet.Spec.Template.Labels),
 		},
 		Spec: daemonSet.Spec.Template.Spec,
 	}

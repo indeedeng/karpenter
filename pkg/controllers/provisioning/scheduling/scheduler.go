@@ -34,6 +34,7 @@ import (
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
@@ -97,6 +98,10 @@ type options struct {
 	minValuesPolicy         karpopts.MinValuesPolicy
 	numConcurrentReconciles int
 	enforceConsolidateAfter bool
+	replacementOnly         bool
+	batchLedger             *BatchLedger
+	additionalExcludedPods  []*corev1.Pod
+	expectedDaemonSetPods   []*corev1.Pod
 }
 
 type Options = option.Function[options]
@@ -135,6 +140,33 @@ var IsConsolidationSimulation = func(opts *options) {
 	opts.enforceConsolidateAfter = enforceConsolidateAfterEnabled()
 }
 
+// ReplacementOnlySimulation prevents pods from scheduling onto existing cluster nodes.
+// Pods may still bin-pack onto NodeClaims created within this scheduler solve.
+var ReplacementOnlySimulation = func(opts *options) {
+	opts.replacementOnly = true
+}
+
+func WithBatchLedger(ledger *BatchLedger) Options {
+	return func(opts *options) {
+		opts.batchLedger = ledger
+	}
+}
+
+func WithAdditionalExcludedPods(pods ...*corev1.Pod) Options {
+	return func(opts *options) {
+		opts.additionalExcludedPods = pods
+	}
+}
+
+// WithExpectedDaemonSetPods counts the given daemon pods in each new NodeClaim's hostname domain for pod affinity and
+// anti-affinity, on the instance types where the pod is compatible. The pods must come from the daemonSetPods passed to
+// NewScheduler.
+func WithExpectedDaemonSetPods(pods ...*corev1.Pod) Options {
+	return func(opts *options) {
+		opts.expectedDaemonSetPods = pods
+	}
+}
+
 func NewScheduler(
 	ctx context.Context,
 	kubeClient client.Client,
@@ -150,7 +182,8 @@ func NewScheduler(
 	allocator *dynamicresources.Allocator,
 	opts ...Options,
 ) *Scheduler {
-	minValuesPolicy := option.Resolve(opts...).minValuesPolicy
+	resolvedOptions := option.Resolve(opts...)
+	minValuesPolicy := resolvedOptions.minValuesPolicy
 
 	// if any of the nodePools add a taint with a prefer no schedule effect, we add a toleration for the taint
 	// during preference relaxation
@@ -185,13 +218,15 @@ func NewScheduler(
 		}
 		return nct, true
 	})
+	daemonOverheadGroups := buildDaemonOverheadGroups(ctx, append(append([]*NodeClaimTemplate{}, templates...), unavailableTemplates...), daemonSetPods)
 	s := &Scheduler{
 		uuid:                 uuid.NewUUID(),
 		kubeClient:           kubeClient,
 		nodeClaimTemplates:   templates,
 		topology:             topology,
 		cluster:              cluster,
-		daemonOverheadGroups: buildDaemonOverheadGroups(ctx, append(append([]*NodeClaimTemplate{}, templates...), unavailableTemplates...), daemonSetPods),
+		daemonOverheadGroups: daemonOverheadGroups,
+		expectedDaemonPods:   buildExpectedDaemonPods(daemonOverheadGroups, resolvedOptions.expectedDaemonSetPods),
 		cachedPodData:        map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
 		volumeReqsByPod:      volumeReqsByPod,          // Volume requirements per pod
 		recorder:             recorder,
@@ -201,14 +236,18 @@ func NewScheduler(
 		}),
 		clock:                   clock,
 		reservationManager:      NewReservationManager(instanceTypes),
-		reservedOfferingMode:    option.Resolve(opts...).reservedOfferingMode,
-		preferencePolicy:        option.Resolve(opts...).preferencePolicy,
+		reservedOfferingMode:    resolvedOptions.reservedOfferingMode,
+		preferencePolicy:        resolvedOptions.preferencePolicy,
 		minValuesPolicy:         minValuesPolicy,
-		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
+		numConcurrentReconciles: lo.Ternary(resolvedOptions.numConcurrentReconciles > 0, resolvedOptions.numConcurrentReconciles, 1),
 		unavailableTemplates:    unavailableTemplates,
 		allocator:               allocator,
 		instanceTypes:           instanceTypes,
 		cachedResourceClaims:    map[types.NamespacedName]*resourcev1.ResourceClaim{},
+		replacementOnly:         resolvedOptions.replacementOnly,
+	}
+	if resolvedOptions.batchLedger != nil {
+		s.reservationManager = resolvedOptions.batchLedger.reservationManagerFor(instanceTypes)
 	}
 
 	npByName := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
@@ -227,7 +266,10 @@ func NewScheduler(
 		}
 	}
 	s.deletingNodeNames = deletingNodeNames
-	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, option.Resolve(opts...).enforceConsolidateAfter)
+	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, resolvedOptions.enforceConsolidateAfter)
+	if resolvedOptions.batchLedger != nil {
+		resolvedOptions.batchLedger.seedScheduler(s)
+	}
 	return s
 }
 
@@ -253,6 +295,7 @@ type Scheduler struct {
 	unavailableTemplates    []*NodeClaimTemplate
 	remainingResources      map[string]corev1.ResourceList // (NodePool name) -> remaining resources for that NodePool
 	daemonOverheadGroups    map[*NodeClaimTemplate][]DaemonOverheadGroup
+	expectedDaemonPods      map[*NodeClaimTemplate]*expectedDaemonPods
 	cachedPodData           map[types.UID]*PodData                  // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
 	volumeReqsByPod         map[types.UID][]scheduling.Requirements // Volume topology requirement alternatives per pod
 	preferences             *Preferences
@@ -267,6 +310,7 @@ type Scheduler struct {
 	minValuesPolicy         karpopts.MinValuesPolicy
 	numConcurrentReconciles int
 	deletingNodeNames       sets.Set[string]
+	replacementOnly         bool
 
 	// allocator simulates DRA device allocation for pods with ResourceClaims. It is nil when DRA support is disabled.
 	allocator *dynamicresources.Allocator
@@ -614,9 +658,11 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 		return err
 	}
 
-	// first try to schedule against an in-flight real node
-	if err := s.addToExistingNode(ctx, pod); err == nil {
-		return nil
+	// Replacement simulations retain existing nodes for accounting but never use them as destinations.
+	if !s.replacementOnly {
+		if err := s.addToExistingNode(ctx, pod); err == nil {
+			return nil
+		}
 	}
 	// Consider using https://pkg.go.dev/container/heap
 	sort.Slice(s.newNodeClaims, func(a, b int) bool { return len(s.newNodeClaims[a].Pods) < len(s.newNodeClaims[b].Pods) })
@@ -723,7 +769,7 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 
 func (s *Scheduler) offeringsUnavailableError(ctx context.Context, pod *corev1.Pod) error {
 	for _, template := range s.unavailableTemplates {
-		nodeClaim := NewNodeClaim(template, s.topology, s.daemonOverheadGroups[template], template.InstanceTypeOptions, s.reservationManager, s.reservedOfferingMode)
+		nodeClaim := NewNodeClaim(template, s.topology, s.daemonOverheadGroups[template], s.expectedDaemonPods[template], template.InstanceTypeOptions, s.reservationManager, s.reservedOfferingMode)
 		_, _, _, _, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort, s.allocator)
 		if IsOfferingsUnavailableError(err) {
 			return err
@@ -766,7 +812,7 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 					"total", len(s.nodeClaimTemplates[i].InstanceTypeOptions))
 			}
 		}
-		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverheadGroups[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode)
+		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverheadGroups[s.nodeClaimTemplates[i]], s.expectedDaemonPods[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode)
 		r, its, ofs, result, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort, s.allocator)
 		if err != nil {
 			errs[i] = err
@@ -833,11 +879,14 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod, nodePoolMap map[string]*v1.NodePool, enforceConsolidateAfter bool) {
 	// create our existing nodes
 	for _, node := range stateNodes {
+		s.updateRemainingResources(node)
+		if s.replacementOnly {
+			continue
+		}
 		taints := node.Taints()
 		daemons := s.getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
 		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Name()], node.NodeClaim, s.clock)
 		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...), s.instanceTypeForNode(node), isUnderConsolidateAfter))
-		s.updateRemainingResources(node)
 	}
 	s.sortExistingNodes()
 }
@@ -1005,6 +1054,8 @@ type DaemonOverheadGroup struct {
 	InstanceTypes  []*cloudprovider.InstanceType
 	DaemonOverhead corev1.ResourceList
 	HostPortUsage  *scheduling.HostPortUsage
+	// Pods are the daemon pods compatible with every instance type in the group.
+	Pods []*corev1.Pod
 }
 
 // buildDaemonOverheadGroups groups instance types by their compatible daemon pods and computes the following for NodeClaimTemplate and group
@@ -1036,6 +1087,7 @@ func buildDaemonOverheadGroups(ctx context.Context, nodeClaimTemplates []*NodeCl
 					InstanceTypes:  []*cloudprovider.InstanceType{it},
 					DaemonOverhead: overhead,
 					HostPortUsage:  hostPortUsage,
+					Pods:           compatible,
 				}
 			}
 		}
@@ -1092,18 +1144,24 @@ func subtractMax(remaining corev1.ResourceList, instanceTypes []*cloudprovider.I
 	if len(instanceTypes) == 0 {
 		return remaining
 	}
-	var allInstanceResources []corev1.ResourceList
-	for _, it := range instanceTypes {
-		allInstanceResources = append(allInstanceResources, it.Capacity)
-	}
+	itResources := maxInstanceResources(instanceTypes)
 	result := corev1.ResourceList{}
-	itResources := resources.MaxResources(allInstanceResources...)
 	for k, v := range remaining {
 		cp := v.DeepCopy()
 		cp.Sub(itResources[k])
 		result[k] = cp
 	}
 	return result
+}
+
+func maxInstanceResources(instanceTypes []*cloudprovider.InstanceType) corev1.ResourceList {
+	var allInstanceResources []corev1.ResourceList
+	for _, it := range instanceTypes {
+		allInstanceResources = append(allInstanceResources, it.Capacity)
+	}
+	itResources := resources.MaxResources(allInstanceResources...)
+	itResources[resources.Node] = resource.MustParse("1")
+	return itResources
 }
 
 // filterByRemainingResources is used to filter out instance types that if launched would exceed the nodepool limits

@@ -287,12 +287,16 @@ func (b *poolBuilder) build(key PoolKey) *Pool {
 
 	var counterSetSlices []ResourceSlice
 	var nonTargetingDeviceSlices []ResourceSlice
-	// Flatten devices only from matching slices; check for duplicates.
+	// Collect counter definitions and flatten devices from matching slices. API-backed
+	// ResourceSlices may define counters and devices together because consumesCounters
+	// references are validated against counter sets on the same ResourceSlice.
 	seenDeviceNames := sets.New[unique.Handle[string]]()
 	for _, e := range b.entries {
 		if e.slice.SharedCounters() != nil {
 			counterSetSlices = append(counterSetSlices, e.slice)
-			continue
+			if len(e.slice.Devices()) == 0 {
+				continue
+			}
 		}
 
 		if !e.matched {

@@ -1001,7 +1001,7 @@ var _ = Describe("Pool Gathering", func() {
 				Expect(pools[0].Devices).To(HaveLen(1))
 			})
 
-			It("should ignore devices on a slice that also declares SharedCounters", func() {
+			It("should include devices on an API slice that also declares SharedCounters", func() {
 				slices := []dynamicresources.ResourceSlice{
 					makeAPISlice("both-slice", "gpu.example.com", "pool-a",
 						withSharedCounters(counterSet("budget", map[string]resource.Quantity{
@@ -1018,8 +1018,9 @@ var _ = Describe("Pool Gathering", func() {
 				}
 				pools := dynamicresources.GatherPools(slices, reqs, "")
 				Expect(pools).To(HaveLen(1))
-				Expect(pools[0].Devices).To(HaveLen(1))
-				Expect(pools[0].Devices[0].ID.Device).To(Equal(unique.Make("gpu-0")))
+				Expect(pools[0].Devices).To(HaveLen(2))
+				Expect(pools[0].Devices[0].ID.Device).To(Equal(unique.Make("ghost-device")))
+				Expect(pools[0].Devices[1].ID.Device).To(Equal(unique.Make("gpu-0")))
 				Expect(pools[0].CounterSets).To(HaveKey("budget"))
 			})
 

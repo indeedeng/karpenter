@@ -28,6 +28,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -80,6 +83,8 @@ type Candidate struct {
 	capacityType      string
 	DisruptionCost    float64
 	reschedulablePods []*corev1.Pod
+	// daemonSets are the DaemonSets with a pod on the candidate.
+	daemonSets sets.Set[types.NamespacedName]
 
 	// Price is the cheapest compatible offering price for this candidate.
 	// Precomputed at creation to avoid repeated offering lookups.
@@ -234,11 +239,23 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		capacityType:      node.Labels()[v1.CapacityTypeLabelKey],
 		zone:              node.Labels()[corev1.LabelTopologyZone],
 		reschedulablePods: reschedulable,
+		daemonSets:        daemonSetOwners(pods),
 		// We get the disruption cost from all pods in the candidate, not just the reschedulable pods
 		DisruptionCost:           disruptionutils.ReschedulingCost(ctx, pods) * disruptionutils.LifetimeRemaining(clk, nodePool, node.NodeClaim) * utilizationWeight(node),
 		Price:                    resolveNodePrice(node, instanceType),
 		RescheduleDisruptionCost: computeRescheduleDisruptionCost(ctx, reschedulable),
 	}, nil
+}
+
+// daemonSetOwners returns the DaemonSets that control any of the given pods.
+func daemonSetOwners(pods []*corev1.Pod) sets.Set[types.NamespacedName] {
+	owners := sets.New[types.NamespacedName]()
+	for _, p := range pods {
+		if owner := metav1.GetControllerOf(p); owner != nil && owner.APIVersion == "apps/v1" && owner.Kind == "DaemonSet" {
+			owners.Insert(types.NamespacedName{Namespace: p.Namespace, Name: owner.Name})
+		}
+	}
+	return owners
 }
 
 type Replacement struct {
