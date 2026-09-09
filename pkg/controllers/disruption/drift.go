@@ -21,29 +21,40 @@ import (
 	"errors"
 	"slices"
 	"sort"
+	"time"
 
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
+)
+
+const (
+	DriftTimeoutDuration = time.Minute
+	DriftMaxBatchSize    = 100
 )
 
 // Drift is a subreconciler that deletes drifted candidates.
 type Drift struct {
-	kubeClient  client.Client
-	cluster     *state.Cluster
-	provisioner *provisioning.Provisioner
-	recorder    events.Recorder
-	clock       clock.Clock
-	backoff     *NodePoolBackoff
+	kubeClient            client.Client
+	cluster               *state.Cluster
+	provisioner           *provisioning.Provisioner
+	recorder              events.Recorder
+	clock                 clock.Clock
+	backoff               *NodePoolBackoff
+	simulateReplacementFn func(context.Context, *Candidate, *scheduling.BatchLedger) (scheduling.Results, *scheduling.Scheduler, error)
 }
 
 func NewDrift(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock, backoff *NodePoolBackoff) *Drift {
@@ -64,6 +75,17 @@ func (d *Drift) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 
 // ComputeCommand generates a disruption command given candidates
 func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	timeout := time.Duration(0)
+	legacyMode := true
+	if options.FromContext(ctx).FeatureGates.DriftReplacementBatching {
+		legacyMode = false
+		timeout = DriftTimeoutDuration
+
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	// Register a zero-valued back-off counter for every NodePool with a drift candidate so the
 	// metric is visible (at 0) for healthy pools rather than being absent until the first back-off.
 	// Add(0) is idempotent: it only ensures the series exists and never clobbers an incremented value.
@@ -83,10 +105,24 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 	// Prioritize empty candidates since we want them to get priority over non-empty candidates if the budget is constrained.
 	// Disrupting empty candidates first also helps reduce the overall churn because if a non-empty candidate is disrupted first,
 	// the pods from that node can reschedule on the empty nodes and will need to move again when those nodes get disrupted.
-	for _, candidate := range slices.Concat(emptyCandidates, nonEmptyCandidates) {
+	var commands []Command
+	var simulator *driftReplacementSimulator
+	ledger := scheduling.NewBatchLedger()
+	orderedCandidates := slices.Concat(emptyCandidates, nonEmptyCandidates)
+	for i, candidate := range orderedCandidates {
+		if len(commands) == DriftMaxBatchSize {
+			break
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			logDriftDeadline(ctx, i, len(orderedCandidates), len(commands))
+			break
+		}
+		if d.cluster != nil && !d.cluster.IsNodeActive(candidate.ProviderID()) {
+			log.FromContext(ctx).V(1).Info("skipping drift candidate that started deleting", "NodeClaim", candidate.NodeClaim.Name)
+			continue
+		}
 		// If the disruption budget doesn't allow this candidate to be disrupted,
-		// continue to the next candidate. We don't need to decrement any budget
-		// counter since drift commands can only have one candidate.
+		// continue to the next candidate.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
@@ -99,14 +135,44 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 			d.recorder.Publish(disruptionevents.NodePoolDriftBackoff(candidate.NodePool, until, level))
 			continue
 		}
-		// Check if we need to create any NodeClaims.
-		results, err := SimulateScheduling(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, nil, candidate)
+		if len(candidate.reschedulablePods) == 0 {
+			commands = append(commands, newDriftCommand(candidate, scheduling.Results{}))
+			ledger.CommitRemoval([]string{candidate.Name()}, nil)
+			disruptionBudgetMapping[candidate.NodePool.Name]--
+			if legacyMode {
+				break
+			}
+			continue
+		}
+		if simulator == nil && d.simulateReplacementFn == nil {
+			var err error
+			simulator, err = newDriftReplacementSimulator(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder)
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					logDriftDeadline(ctx, i, len(orderedCandidates), len(commands))
+					break
+				}
+				return []Command{}, err
+			}
+		}
+		simulateReplacement := d.simulateReplacementFn
+		if simulateReplacement == nil {
+			simulateReplacement = simulator.simulate
+		}
+		results, scheduler, err := simulateReplacement(ctx, candidate, ledger)
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				logDriftDeadline(ctx, i+1, len(orderedCandidates), len(commands))
+				break
+			}
 			// if a candidate is now deleting, just retry
 			if errors.Is(err, errCandidateDeleting) {
 				continue
 			}
 			return []Command{}, err
+		}
+		if d.cluster != nil && !d.cluster.IsNodeActive(candidate.ProviderID()) {
+			continue
 		}
 		// Emit an event that we couldn't reschedule the pods on the node.
 		if !results.AllNonPendingPodsScheduled() {
@@ -114,16 +180,34 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 			continue
 		}
 
-		cmd := Command{
-			Candidates:          []*Candidate{candidate},
-			Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
-			Results:             results,
-			PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+		commands = append(commands, newDriftCommand(candidate, results))
+		acceptedPods := lo.FlatMap(results.NewNodeClaims, func(nodeClaim *scheduling.NodeClaim, _ int) []*corev1.Pod {
+			return nodeClaim.Pods
+		})
+		ledger.Commit(scheduler, results, []string{candidate.Name()}, acceptedPods)
+		disruptionBudgetMapping[candidate.NodePool.Name]--
+		if legacyMode {
+			break
 		}
-		return []Command{cmd}, nil
-
 	}
-	return []Command{}, nil
+	return commands, nil
+}
+
+func logDriftDeadline(ctx context.Context, candidatesEvaluated, candidateCount, commandCount int) {
+	log.FromContext(ctx).V(1).Info("drift scheduling simulation timed out",
+		"candidates_evaluated", candidatesEvaluated,
+		"commands", commandCount,
+		"candidates_remaining", candidateCount-candidatesEvaluated,
+	)
+}
+
+func newDriftCommand(candidate *Candidate, results scheduling.Results) Command {
+	return Command{
+		Candidates:          []*Candidate{candidate},
+		Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
+		Results:             results,
+		PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+	}
 }
 
 func (d *Drift) Reason() v1.DisruptionReason {

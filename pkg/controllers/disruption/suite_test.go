@@ -95,7 +95,7 @@ func TestAPIs(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
-	env = test.NewEnvironment(test.WithCRDs(coreapis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
+	env = test.NewEnvironment(test.WithCRDs(coreapis.CRDs...), test.WithCRDs(v1alpha1.CRDs...), test.WithDRAPartitionableDevices())
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)
@@ -183,6 +183,8 @@ var _ = AfterEach(func() {
 	// Reset the metrics collectors
 	disruption.DecisionsPerformedTotal.Reset()
 	disruption.NodepoolDecisionsPerformed.Reset()
+	disruption.CandidateDiscoveryDurationSeconds.Reset()
+	disruption.DriftReplacementSimulationDurationSeconds.Reset()
 })
 
 var _ = Describe("Launch Backoff", func() {
@@ -416,41 +418,17 @@ var _ = Describe("Simulate Scheduling", func() {
 		nodeClaimNames := sets.New(lo.Map(nodeClaims, func(nc *v1.NodeClaim, _ int) string { return nc.Name })...)
 		ExpectSingletonReconciled(ctx, disruptionController)
 
-		// Expect a replace action
-		ExpectTaintedNodeCount(ctx, env.Client, 1)
+		// The budget allows three replacement actions in a single pass.
+		ExpectTaintedNodeCount(ctx, env.Client, 3)
 		ncs := ExpectNodeClaims(ctx, env.Client)
-		// which would create one more node claim
-		Expect(len(ncs)).To(Equal(11))
-		nc, ok := lo.Find(ncs, func(nc *v1.NodeClaim) bool {
-			return !nodeClaimNames.Has(nc.Name)
-		})
-		Expect(ok).To(BeTrue())
-		// which needs to be deployed
-		ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, nc)
-		nodeClaimNames[nc.Name] = struct{}{}
-		ExpectSingletonReconciled(ctx, disruptionController)
-
-		// Another replacement disruption action
-		ncs = ExpectNodeClaims(ctx, env.Client)
-		Expect(len(ncs)).To(Equal(12))
-		nc, ok = lo.Find(ncs, func(nc *v1.NodeClaim) bool {
-			return !nodeClaimNames.Has(nc.Name)
-		})
-		Expect(ok).To(BeTrue())
-		ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, nc)
-		nodeClaimNames[nc.Name] = struct{}{}
-
-		ExpectSingletonReconciled(ctx, disruptionController)
-
-		// One more replacement disruption action
-		ncs = ExpectNodeClaims(ctx, env.Client)
 		Expect(len(ncs)).To(Equal(13))
-		nc, ok = lo.Find(ncs, func(nc *v1.NodeClaim) bool {
+		replacements := lo.Filter(ncs, func(nc *v1.NodeClaim, _ int) bool {
 			return !nodeClaimNames.Has(nc.Name)
 		})
-		Expect(ok).To(BeTrue())
-		ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, nc)
-		nodeClaimNames[nc.Name] = struct{}{}
+		Expect(replacements).To(HaveLen(3))
+		for _, replacement := range replacements {
+			ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacement)
+		}
 
 		// Try one more time, but fail since the budgets only allow 3 disruptions.
 		ExpectSingletonReconciled(ctx, disruptionController)
@@ -2045,7 +2023,7 @@ var _ = Describe("Metrics", func() {
 			"consolidation_type":  "empty",
 		})
 	})
-	It("should fire metrics for single node delete disruption", func() {
+	It("should fire metrics for single node drift replacement", func() {
 		nodeClaims, nodes = nodeClaims[:2], nodes[:2]
 		pods := test.Pods(4, test.PodOptions{})
 
@@ -2065,13 +2043,17 @@ var _ = Describe("Metrics", func() {
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
 		ExpectSingletonReconciled(ctx, disruptionController)
 
+		ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_candidate_discovery_duration_seconds", 1, map[string]string{
+			metrics.ReasonLabel: "drifted",
+		})
+		ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_drift_replacement_simulation_duration_seconds", 1, nil)
 		ExpectMetricCounterValue(disruption.DecisionsPerformedTotal, 1, map[string]string{
-			"decision":          "delete",
+			"decision":          "replace",
 			metrics.ReasonLabel: "drifted",
 		})
 		ExpectMetricCounterValue(disruption.NodepoolDecisionsPerformed, 1, map[string]string{
 			metrics.NodePoolLabel: nodePool.Name,
-			"decision":            "delete",
+			"decision":            "replace",
 			metrics.ReasonLabel:   "drifted",
 		})
 	})

@@ -56,13 +56,14 @@ type optionsKey struct{}
 type FeatureGates struct {
 	inputStr string
 
-	NodeRepair              bool
-	ReservedCapacity        bool
-	SpotToSpotConsolidation bool
-	NodeOverlay             bool
-	StaticCapacity          bool
-	CapacityBuffer          bool
-	LaunchBackoff           bool
+	NodeRepair               bool
+	ReservedCapacity         bool
+	SpotToSpotConsolidation  bool
+	NodeOverlay              bool
+	StaticCapacity           bool
+	CapacityBuffer           bool
+	LaunchBackoff            bool
+	DriftReplacementBatching bool
 }
 
 // Options contains all CLI flags / env vars for karpenter-core. It adheres to the options.Injectable interface.
@@ -132,7 +133,7 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.StringVar(&o.preferencePolicyRaw, "preference-policy", env.WithDefaultString("PREFERENCE_POLICY", string(PreferencePolicyRespect)), "How the Karpenter scheduler should treat preferences. Preferences include preferredDuringSchedulingIgnoreDuringExecution node and pod affinities/anti-affinities and ScheduleAnyways topologySpreadConstraints. Can be one of 'Ignore' and 'Respect'")
 	fs.StringVar(&o.minValuesPolicyRaw, "min-values-policy", env.WithDefaultString("MIN_VALUES_POLICY", string(MinValuesPolicyStrict)), "Min values policy for scheduling. Options include 'Strict' for existing behavior where min values are strictly enforced or 'BestEffort' where Karpenter relaxes min values when it isn't satisfied.")
 	fs.BoolVarWithEnv(&o.IgnoreDRARequests, "ignore-dra-requests", "IGNORE_DRA_REQUESTS", true, "When set, Karpenter will ignore pods' DRA requests during scheduling simulations. NOTE: This flag will be removed once formal DRA support is GA in Karpenter.")
-	fs.StringVar(&o.FeatureGates.inputStr, "feature-gates", env.WithDefaultString("FEATURE_GATES", "NodeRepair=false,ReservedCapacity=true,SpotToSpotConsolidation=false,NodeOverlay=false,StaticCapacity=false,CapacityBuffer=false,LaunchBackoff=false"), "Optional features can be enabled / disabled using feature gates. Current options are: NodeRepair, ReservedCapacity, SpotToSpotConsolidation, NodeOverlay, StaticCapacity, CapacityBuffer, and LaunchBackoff.")
+	fs.StringVar(&o.FeatureGates.inputStr, "feature-gates", env.WithDefaultString("FEATURE_GATES", "NodeRepair=false,ReservedCapacity=true,SpotToSpotConsolidation=false,NodeOverlay=false,StaticCapacity=false,CapacityBuffer=false,LaunchBackoff=false,DriftReplacementBatching=true"), "Optional features can be enabled / disabled using feature gates. Current options are: NodeRepair, ReservedCapacity, SpotToSpotConsolidation, NodeOverlay, StaticCapacity, CapacityBuffer, LaunchBackoff, and DriftReplacementBatching.")
 }
 
 func (o *Options) Parse(fs *FlagSet, args ...string) error {
@@ -170,13 +171,14 @@ func (o *Options) ToContext(ctx context.Context) context.Context {
 
 func DefaultFeatureGates() FeatureGates {
 	return FeatureGates{
-		NodeRepair:              false,
-		ReservedCapacity:        true,
-		SpotToSpotConsolidation: false,
-		NodeOverlay:             false,
-		StaticCapacity:          false,
-		CapacityBuffer:          false,
-		LaunchBackoff:           false,
+		NodeRepair:               false,
+		ReservedCapacity:         true,
+		SpotToSpotConsolidation:  false,
+		NodeOverlay:              false,
+		StaticCapacity:           false,
+		CapacityBuffer:           false,
+		LaunchBackoff:            false,
+		DriftReplacementBatching: true,
 	}
 }
 
@@ -209,6 +211,9 @@ func ParseFeatureGates(gateStr string) (FeatureGates, error) {
 	}
 	if val, ok := gateMap["LaunchBackoff"]; ok {
 		gates.LaunchBackoff = val
+	}
+	if val, ok := gateMap["DriftReplacementBatching"]; ok {
+		gates.DriftReplacementBatching = val
 	}
 
 	return gates, nil
