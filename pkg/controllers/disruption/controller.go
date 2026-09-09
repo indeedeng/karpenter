@@ -197,7 +197,14 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
 		ConsolidationTypeLabel: disruption.ConsolidationType(),
 	})()
+	candidateDiscoveryStart := time.Now()
 	candidates, nodePoolTotals, err := GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
+	if _, ok := disruption.(*Drift); ok {
+		CandidateDiscoveryDurationSeconds.Observe(time.Since(candidateDiscoveryStart).Seconds(), map[string]string{
+			metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
+			ConsolidationTypeLabel: disruption.ConsolidationType(),
+		})
+	}
 	if err != nil {
 		return false, fmt.Errorf("determining candidates, %w", err)
 	}

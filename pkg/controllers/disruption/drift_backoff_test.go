@@ -187,7 +187,7 @@ var _ = Describe("Drift back-off", func() {
 		})
 	})
 	Context("Starvation regression", func() {
-		It("lets a younger NodePool progress after the oldest pool's replacement fails unrecoverably", func() {
+		It("batches a younger NodePool before the oldest pool's replacement fails unrecoverably", func() {
 			rs := test.ReplicaSet()
 			ExpectApplied(ctx, env.Client, rs)
 
@@ -202,31 +202,33 @@ var _ = Describe("Drift back-off", func() {
 			ExpectManualBinding(ctx, env.Client, healthyPod, healthyNode)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{stuckNode, healthyNode}, []*v1.NodeClaim{stuckNC, healthyNC})
 
-			// Pass 1: the oldest (stuck) pool is selected and a replacement is launched.
+			// Both pools are selected in one pass, so the younger pool doesn't wait for the
+			// oldest pool's replacement failure and subsequent back-off.
 			ExpectSingletonReconciled(ctx, disruptionController)
 			cmds := queue.GetCommands()
-			Expect(cmds).To(HaveLen(1))
-			Expect(cmds[0].Candidates[0].NodePool.Name).To(Equal(stuck.Name))
-			Expect(cmds[0].Replacements).To(HaveLen(1))
+			Expect(cmds).To(HaveLen(2))
+			stuckCommand, ok := lo.Find(cmds, func(cmd *disruption.Command) bool {
+				return cmd.Candidates[0].NodePool.Name == stuck.Name
+			})
+			Expect(ok).To(BeTrue())
+			_, ok = lo.Find(cmds, func(cmd *disruption.Command) bool {
+				return cmd.Candidates[0].NodePool.Name == healthy.Name
+			})
+			Expect(ok).To(BeTrue())
+			Expect(stuckCommand.Replacements).To(HaveLen(1))
 
 			// Simulate an ICE: the replacement NodeClaim is deleted before it initializes. The queue
 			// observes this as an unrecoverable failure, which arms back-off for the stuck pool and
 			// returns its candidate to the pool unchanged.
-			replacementName := cmds[0].Replacements[0].Name
+			replacementName := stuckCommand.Replacements[0].Name
 			replacementNC := &v1.NodeClaim{}
 			Expect(env.Client.Get(ctx, types.NamespacedName{Name: replacementName}, replacementNC)).To(Succeed())
 			ExpectDeleted(ctx, env.Client, replacementNC)
 			cluster.DeleteNodeClaim(replacementName)
 
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectObjectReconciled(ctx, env.Client, queue, stuckCommand.Candidates[0].NodeClaim)
 			Expect(queue.NodePoolBackoff().IsBackedOff(stuck.Name)).To(BeTrue())
 			ExpectExists(ctx, env.Client, stuckNC)
-
-			// Pass 2: the stuck pool is skipped, so the younger healthy pool finally makes progress.
-			ExpectSingletonReconciled(ctx, disruptionController)
-			cmds = queue.GetCommands()
-			Expect(cmds).To(HaveLen(1))
-			Expect(cmds[0].Candidates[0].NodePool.Name).To(Equal(healthy.Name))
 		})
 	})
 })
