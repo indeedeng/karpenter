@@ -121,13 +121,14 @@ var _ = Describe("Options", func() {
 				PreferencePolicy:                 lo.ToPtr(options.PreferencePolicyRespect),
 				MinValuesPolicy:                  lo.ToPtr(options.MinValuesPolicyStrict),
 				FeatureGates: test.FeatureGates{
-					ReservedCapacity:        new(true),
-					NodeRepair:              new(false),
-					SpotToSpotConsolidation: new(false),
-					NodeOverlay:             new(false),
-					StaticCapacity:          new(false),
-					CapacityBuffer:          new(false),
-					NodePoolDriftBackoff:    new(true),
+					ReservedCapacity:         new(true),
+					NodeRepair:               new(false),
+					SpotToSpotConsolidation:  new(false),
+					NodeOverlay:              new(false),
+					StaticCapacity:           new(false),
+					CapacityBuffer:           new(false),
+					NodePoolDriftBackoff:     new(true),
+					DriftReplacementBatching: new(true),
 				},
 				IgnoreDRARequests: new(true),
 			}))
@@ -346,6 +347,7 @@ var _ = Describe("Options", func() {
 			Entry("when CapacityBuffer is overridden", "CapacityBuffer"),
 			Entry("when NodePoolDriftBackoff is overridden", "NodePoolDriftBackoff"),
 			Entry("when LaunchBackoff is overridden", "LaunchBackoff"),
+			Entry("when DriftReplacementBatching is overridden", "DriftReplacementBatching"),
 		)
 	})
 
@@ -416,6 +418,7 @@ func expectOptionsMatch(optsA, optsB *options.Options) {
 	Expect(optsA.FeatureGates.NodeOverlay).To(Equal(optsB.FeatureGates.NodeOverlay))
 	Expect(optsA.FeatureGates.StaticCapacity).To(Equal(optsB.FeatureGates.StaticCapacity))
 	Expect(optsA.FeatureGates.CapacityBuffer).To(Equal(optsB.FeatureGates.CapacityBuffer))
+	Expect(optsA.FeatureGates.DriftReplacementBatching).To(Equal(optsB.FeatureGates.DriftReplacementBatching))
 	Expect(optsA.FeatureGates.SpotToSpotConsolidation).To(Equal(optsB.FeatureGates.SpotToSpotConsolidation))
 	Expect(optsA.FeatureGates.NodePoolDriftBackoff).To(Equal(optsB.FeatureGates.NodePoolDriftBackoff))
 	Expect(optsA.FeatureGates.LaunchBackoff).To(Equal(optsB.FeatureGates.LaunchBackoff))

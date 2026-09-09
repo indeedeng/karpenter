@@ -209,22 +209,13 @@ func (p *Provisioner) reserveNodeClaims(ctx context.Context, nodeClaims []*sched
 	claimsByID := make(map[string]*scheduler.NodeClaim, len(nodeClaims))
 	ids := make([]string, 0, len(nodeClaims))
 	for _, nodeClaim := range nodeClaims {
-		its, ok := instanceTypes[nodeClaim.NodePoolName]
-		if !ok {
-			nodePool := &v1.NodePool{}
-			if err := p.kubeClient.Get(ctx, client.ObjectKey{Name: nodeClaim.NodePoolName}, nodePool); err != nil {
-				return ReservationResults{}, fmt.Errorf("getting nodepool for launch reservation, %w", err)
-			}
-			var err error
-			its, err = p.cloudProvider.GetInstanceTypes(ctx, nodePool)
-			if err != nil {
-				return ReservationResults{}, fmt.Errorf("getting instance types for launch reservation, %w", err)
-			}
-			instanceTypes[nodeClaim.NodePoolName] = its
+		keys, err := p.candidateOfferings(ctx, nodeClaim, instanceTypes)
+		if err != nil {
+			return ReservationResults{}, err
 		}
 		id := string(uuid.NewUUID())
 		ids = append(ids, id)
-		candidates[id] = launchbackoff.CandidateOfferings(nodeClaim.ToNodeClaim(), its)
+		candidates[id] = keys
 		claimsByID[id] = nodeClaim
 	}
 
@@ -293,6 +284,62 @@ func (p *Provisioner) ReleaseNodeClaimReservations(nodeClaims []*scheduler.NodeC
 			p.launchBackoff.Release(id)
 		}
 	}
+}
+
+// candidateOfferings expands a NodeClaim against its NodePool's unfiltered instance types,
+// caching instance types per NodePool in instanceTypes.
+func (p *Provisioner) candidateOfferings(ctx context.Context, nodeClaim *scheduler.NodeClaim, instanceTypes map[string][]*cloudprovider.InstanceType) ([]cloudprovider.OfferingKey, error) {
+	its, ok := instanceTypes[nodeClaim.NodePoolName]
+	if !ok {
+		nodePool := &v1.NodePool{}
+		if err := p.kubeClient.Get(ctx, client.ObjectKey{Name: nodeClaim.NodePoolName}, nodePool); err != nil {
+			return nil, fmt.Errorf("getting nodepool for launch reservation, %w", err)
+		}
+		var err error
+		its, err = p.cloudProvider.GetInstanceTypes(ctx, nodePool)
+		if err != nil {
+			return nil, fmt.Errorf("getting instance types for launch reservation, %w", err)
+		}
+		instanceTypes[nodeClaim.NodePoolName] = its
+	}
+	return launchbackoff.CandidateOfferings(nodeClaim.ToNodeClaim(), its), nil
+}
+
+// ReplacementAdmission predicts whether ReserveReplacementNodeClaims would admit a set of
+// replacements, without holding launch budget. Admitted sets debit the prediction, so replacements
+// computed later in the same pass contend for the budget earlier ones will reserve.
+type ReplacementAdmission struct {
+	provisioner   *Provisioner
+	preview       *launchbackoff.Preview
+	instanceTypes map[string][]*cloudprovider.InstanceType
+}
+
+func (p *Provisioner) NewReplacementAdmission(ctx context.Context) *ReplacementAdmission {
+	if p == nil || p.launchBackoff == nil || !options.FromContext(ctx).FeatureGates.LaunchBackoff || p.launchBackoff.Empty() {
+		return nil
+	}
+	return &ReplacementAdmission{
+		provisioner:   p,
+		preview:       p.launchBackoff.Preview(),
+		instanceTypes: map[string][]*cloudprovider.InstanceType{},
+	}
+}
+
+// Admit fails open when offerings can't be resolved so that the reservation in StartCommand
+// surfaces the error.
+func (a *ReplacementAdmission) Admit(ctx context.Context, nodeClaims []*scheduler.NodeClaim) bool {
+	if a == nil || len(nodeClaims) == 0 {
+		return true
+	}
+	requests := make([][]cloudprovider.OfferingKey, 0, len(nodeClaims))
+	for _, nodeClaim := range nodeClaims {
+		keys, err := a.provisioner.candidateOfferings(ctx, nodeClaim, a.instanceTypes)
+		if err != nil {
+			return true
+		}
+		requests = append(requests, keys)
+	}
+	return a.preview.AdmitBatch(requests)
 }
 
 func (p *Provisioner) requeueForSchedulingResults(results scheduler.Results, reservations ReservationResults) reconciler.Result {
@@ -422,6 +469,19 @@ func (p *Provisioner) NewScheduler(
 	deletingPodUIDs sets.Set[types.UID],
 	opts ...scheduler.Options,
 ) (*scheduler.Scheduler, error) {
+	return p.newScheduler(ctx, pods, stateNodes, stateNodes, deletingPodUIDs, nil, opts...)
+}
+
+// SchedulerCatalog contains scheduler inputs that are safe to reuse across fresh scheduling
+// simulations within a single controller pass.
+type SchedulerCatalog struct {
+	nodePools     []*v1.NodePool
+	instanceTypes map[string][]*cloudprovider.InstanceType
+	daemonSetPods []*corev1.Pod
+}
+
+// NewSchedulerCatalog captures read-only scheduler inputs for reuse within one controller pass.
+func (p *Provisioner) NewSchedulerCatalog(ctx context.Context) (*SchedulerCatalog, error) {
 	nodePools, err := nodepoolutils.ListManaged(ctx, p.kubeClient, p.cloudProvider)
 	if err != nil {
 		return nil, fmt.Errorf("listing nodepools, %w", err)
@@ -431,7 +491,7 @@ func (p *Provisioner) NewScheduler(
 			return false
 		}
 		if !np.StatusConditions().IsTrue(status.ConditionReady) {
-			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Error(err, "ignoring nodepool, not ready")
+			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("ignoring nodepool, not ready")
 			return false
 		}
 		return np.DeletionTimestamp.IsZero()
@@ -469,6 +529,55 @@ func (p *Provisioner) NewScheduler(
 		// cached view.
 		instanceTypes[np.Name] = launchbackoff.FilterUnavailable(ctx, its, p.launchBackoff)
 	}
+	daemonSetPods, err := p.getDaemonSetPods(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting daemon pods, %w", err)
+	}
+	return &SchedulerCatalog{
+		nodePools:     nodePools,
+		instanceTypes: instanceTypes,
+		daemonSetPods: daemonSetPods,
+	}, nil
+}
+
+// NewReplacementScheduler constructs a scheduler that keeps the full node snapshot for
+// topology and DRA discovery while using only accountingNodes for NodePool limit usage.
+// Existing cluster nodes are never exposed as scheduling destinations.
+func (p *Provisioner) NewReplacementScheduler(
+	ctx context.Context,
+	pods []*corev1.Pod,
+	stateNodes []*state.StateNode,
+	accountingNodes []*state.StateNode,
+	deletingPodUIDs sets.Set[types.UID],
+	additionalExcludedPods []*corev1.Pod,
+	ledger *scheduler.BatchLedger,
+	catalog *SchedulerCatalog,
+	opts ...scheduler.Options,
+) (*scheduler.Scheduler, error) {
+	opts = append(opts,
+		scheduler.ReplacementOnlySimulation,
+		scheduler.WithAdditionalExcludedPods(additionalExcludedPods...),
+		scheduler.WithBatchLedger(ledger),
+	)
+	return p.newScheduler(ctx, pods, stateNodes, accountingNodes, deletingPodUIDs, catalog, opts...)
+}
+
+func (p *Provisioner) newScheduler(
+	ctx context.Context,
+	pods []*corev1.Pod,
+	stateNodes []*state.StateNode,
+	accountingNodes []*state.StateNode,
+	deletingPodUIDs sets.Set[types.UID],
+	catalog *SchedulerCatalog,
+	opts ...scheduler.Options,
+) (*scheduler.Scheduler, error) {
+	if catalog == nil {
+		var err error
+		catalog, err = p.NewSchedulerCatalog(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Get volume topology requirements WITHOUT modifying pods.
 	// Volume requirements are passed separately and added to nodeRequirements only.
@@ -479,13 +588,9 @@ func (p *Provisioner) NewScheduler(
 	}
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
-	topology, err := scheduler.NewTopology(ctx, p.kubeClient, p.cluster, stateNodes, nodePools, instanceTypes, pods, opts...)
+	topology, err := scheduler.NewTopology(ctx, p.kubeClient, p.cluster, stateNodes, catalog.nodePools, catalog.instanceTypes, pods, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
-	}
-	daemonSetPods, err := p.getDaemonSetPods(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting daemon pods, %w", err)
 	}
 
 	// Build the DRA device allocator for this scheduling loop. Slice/device gathering happens here (rather than in the
@@ -501,11 +606,11 @@ func (p *Provisioner) NewScheduler(
 		if err != nil {
 			return nil, fmt.Errorf("gathering allocated devices, %w", err)
 		}
-		allocator = dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(instanceTypes), p.kubeClient, deletingPodUIDs)
+		allocator = dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(catalog.instanceTypes), p.kubeClient, deletingPodUIDs)
 	}
 
 	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
-	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, opts...), nil
+	return scheduler.NewScheduler(ctx, p.kubeClient, catalog.nodePools, p.cluster, accountingNodes, topology, catalog.instanceTypes, catalog.daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, opts...), nil
 }
 
 func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
