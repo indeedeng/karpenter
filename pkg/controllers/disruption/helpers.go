@@ -153,6 +153,84 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	return results, nil
 }
 
+type driftReplacementSimulator struct {
+	provisioner *provisioning.Provisioner
+	cluster     *state.Cluster
+	clock       clock.Clock
+	recorder    events.Recorder
+	nodes       state.StateNodes
+	pdbs        pdb.Limits
+	catalog     *provisioning.SchedulerCatalog
+}
+
+func newDriftReplacementSimulator(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder) (*driftReplacementSimulator, error) {
+	pdbs, err := pdb.NewLimits(ctx, kubeClient)
+	if err != nil {
+		return nil, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
+	}
+	catalog, err := provisioner.NewSchedulerCatalog(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("building scheduler catalog, %w", err)
+	}
+	return &driftReplacementSimulator{
+		provisioner: provisioner,
+		cluster:     cluster,
+		clock:       clk,
+		recorder:    recorder,
+		nodes:       cluster.DeepCopyNodes(),
+		pdbs:        pdbs,
+		catalog:     catalog,
+	}, nil
+}
+
+func (s *driftReplacementSimulator) simulate(ctx context.Context, candidate *Candidate, ledger *scheduling.BatchLedger) (scheduling.Results, *scheduling.Scheduler, error) {
+	defer metrics.Measure(DriftReplacementSimulationDurationSeconds, nil)()
+	if !s.cluster.IsNodeActive(candidate.ProviderID()) {
+		return scheduling.Results{}, nil, errCandidateDeleting
+	}
+
+	pods := lo.Filter(candidate.reschedulablePods, func(pod *corev1.Pod, _ int) bool {
+		return s.pdbs.IsCurrentlyReschedulable(pod, s.clock, s.recorder)
+	})
+	removedNodeNames := ledger.RemovedNodeNames()
+	removedNodeNames.Insert(candidate.Name())
+	accountingNodes := lo.Filter(s.nodes.Active(), func(node *state.StateNode, _ int) bool {
+		return !removedNodeNames.Has(node.Name())
+	})
+	removedPods := append(ledger.RemovedPods(), pods...)
+	deletingPodUIDs := sets.New(lo.Map(removedPods, func(pod *corev1.Pod, _ int) types.UID {
+		return pod.UID
+	})...)
+
+	var opts []scheduling.Options
+	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
+		opts = append(opts, scheduling.IgnorePreferences)
+	}
+	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
+	scheduler, err := s.provisioner.NewReplacementScheduler(
+		log.IntoContext(ctx, operatorlogging.NopLogger),
+		pods,
+		s.nodes.Active(),
+		accountingNodes,
+		deletingPodUIDs,
+		ledger.RemovedPods(),
+		ledger,
+		s.catalog,
+		opts...,
+	)
+	if err != nil {
+		return scheduling.Results{}, nil, fmt.Errorf("creating scheduler, %w", err)
+	}
+	results, err := scheduler.Solve(log.IntoContext(ctx, operatorlogging.NopLogger), pods)
+	if err != nil {
+		return results, scheduler, fmt.Errorf("scheduling pods, %w", err)
+	}
+	if !s.cluster.IsNodeActive(candidate.ProviderID()) {
+		return scheduling.Results{}, nil, errCandidateDeleting
+	}
+	return results.TruncateInstanceTypes(ctx, scheduling.MaxInstanceTypes), scheduler, nil
+}
+
 // UninitializedNodeError tracks a special pod error for disruption where pods schedule to a node
 // that hasn't been initialized yet, meaning that we can't be confident to make a disruption decision based off of it
 type UninitializedNodeError struct {

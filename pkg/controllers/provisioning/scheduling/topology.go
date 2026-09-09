@@ -75,9 +75,10 @@ func NewTopology(
 	pods []*corev1.Pod,
 	opts ...Options,
 ) (*Topology, error) {
+	resolvedOptions := option.Resolve(opts...)
 	t := &Topology{
 		kubeClient:            kubeClient,
-		preferencePolicy:      option.Resolve(opts...).preferencePolicy,
+		preferencePolicy:      resolvedOptions.preferencePolicy,
 		cluster:               cluster,
 		stateNodes:            stateNodes,
 		domainGroups:          buildDomainGroups(nodePools, instanceTypes),
@@ -86,15 +87,18 @@ func NewTopology(
 		excludedPods:          sets.New[string](),
 	}
 
+	allPods := make([]*corev1.Pod, 0, len(pods)+len(resolvedOptions.additionalExcludedPods))
+	allPods = append(allPods, pods...)
+	allPods = append(allPods, resolvedOptions.additionalExcludedPods...)
 	// these are the pods that we intend to schedule, so if they are currently in the cluster we shouldn't count them for
 	// topology purposes
-	for _, p := range pods {
+	for _, p := range allPods {
 		t.excludedPods.Insert(string(p.UID))
 	}
 
 	errs := t.updateInverseAffinities(ctx)
-	for i := range pods {
-		errs = multierr.Append(errs, t.Update(ctx, pods[i]))
+	for _, p := range allPods {
+		errs = multierr.Append(errs, t.Update(ctx, p))
 	}
 	if errs != nil {
 		return nil, errs

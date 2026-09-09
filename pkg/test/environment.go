@@ -53,9 +53,10 @@ type Environment struct {
 }
 
 type EnvironmentOptions struct {
-	crds          []*apiextensionsv1.CustomResourceDefinition
-	fieldIndexers []func(cache.Cache) error
-	configOptions []func(*rest.Config)
+	crds                           []*apiextensionsv1.CustomResourceDefinition
+	fieldIndexers                  []func(cache.Cache) error
+	configOptions                  []func(*rest.Config)
+	draPartitionableDevicesEnabled bool
 }
 
 // WithCRDs registers the specified CRDs to the apiserver for use in testing
@@ -79,6 +80,14 @@ func WithFieldIndexers(fieldIndexers ...func(cache.Cache) error) option.Function
 func WithConfigOptions(options ...func(*rest.Config)) option.Function[EnvironmentOptions] {
 	return func(o *EnvironmentOptions) {
 		o.configOptions = append(o.configOptions, options...)
+	}
+}
+
+// WithDRAPartitionableDevices enables the Kubernetes API server feature gate used by
+// integration tests for shared DRA counters and consumable device capacity.
+func WithDRAPartitionableDevices() option.Function[EnvironmentOptions] {
+	return func(o *EnvironmentOptions) {
+		o.draPartitionableDevicesEnabled = true
 	}
 }
 
@@ -157,6 +166,11 @@ func NewEnvironment(options ...option.Function[EnvironmentOptions]) *Environment
 		// See https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/#spread-constraint-definition
 		// Ref: https://github.com/aws/karpenter-core/pull/330
 		environment.ControlPlane.GetAPIServer().Configure().Set("feature-gates", "MinDomainsInPodTopologySpread=true")
+	}
+	if opts.draPartitionableDevicesEnabled && version.Minor() >= 34 {
+		// Partitionable devices are exercised by the DRA integration suites. When this alpha feature gate is disabled,
+		// the API server silently strips shared counter and consumable capacity fields from ResourceSlices.
+		environment.ControlPlane.GetAPIServer().Configure().Set("feature-gates", "DRAPartitionableDevices=true")
 	}
 
 	_ = lo.Must(environment.Start())

@@ -114,6 +114,21 @@ var _ = AfterEach(func() {
 })
 
 var _ = Describe("Provisioning", func() {
+	It("should reuse a scheduler catalog across replacement simulations", func() {
+		nodePool := test.NodePool()
+		ExpectApplied(ctx, env.Client, nodePool)
+		before := cloudProvider.GetInstanceTypesCalls.Load()
+		catalog, err := prov.NewSchedulerCatalog(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(cloudProvider.GetInstanceTypesCalls.Load() - before).To(Equal(int64(1)))
+
+		ledger := pscheduling.NewBatchLedger()
+		for range 2 {
+			_, err = prov.NewReplacementScheduler(ctx, nil, nil, nil, nil, nil, ledger, catalog)
+			Expect(err).ToNot(HaveOccurred())
+		}
+		Expect(cloudProvider.GetInstanceTypesCalls.Load() - before).To(Equal(int64(1)))
+	})
 	Context("Batcher", func() {
 		It("should provision single pod if no other pod is received within the batch idle duration", func() {
 			pod := test.UnschedulablePod()
