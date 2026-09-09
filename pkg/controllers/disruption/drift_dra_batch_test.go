@@ -29,6 +29,7 @@ import (
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/version"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -44,7 +45,7 @@ var _ = Describe("Drift/DRA batching", func() {
 	var replicaSet *appsv1.ReplicaSet
 
 	BeforeEach(func() {
-		if env.Version.Minor() < 34 {
+		if driftDRAServerMinor() < 34 {
 			Skip("DRA is only available in K8s versions >= 1.34.x")
 		}
 		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{IgnoreDRARequests: lo.ToPtr(false)}))
@@ -74,7 +75,7 @@ var _ = Describe("Drift/DRA batching", func() {
 	})
 
 	It("carries accepted multi-allocatable capacity into later drift solves", func() {
-		if env.Version.Minor() < 36 {
+		if driftDRAServerMinor() < 36 {
 			Skip("Consumable capacity requires K8s versions >= 1.36.x")
 		}
 		ExpectApplied(ctx, env.Client, test.SharedCapacitySlice("capacity-target", test.GPUDriver, "gpu-0", "16Gi"))
@@ -255,7 +256,7 @@ func driftDRACounterSlices(pool, counterSet, counter, total string, devices ...r
 			counter: {Value: resource.MustParse(total)},
 		},
 	}}
-	if env.Version.Minor() < 35 {
+	if driftDRAServerMinor() < 35 {
 		return []resourcev1.ResourceSlice{
 			*test.ResourceSlice(resourcev1.ResourceSlice{
 				ObjectMeta: metav1.ObjectMeta{Name: pool},
@@ -294,6 +295,15 @@ func driftDRACounterSlices(pool, counterSet, counter, total string, devices ...r
 			},
 		}),
 	}
+}
+
+func driftDRAServerMinor() int {
+	GinkgoHelper()
+	serverVersion, err := env.KubernetesInterface.Discovery().ServerVersion()
+	Expect(err).ToNot(HaveOccurred())
+	parsedVersion, err := version.ParseGeneric(serverVersion.GitVersion)
+	Expect(err).ToNot(HaveOccurred())
+	return int(parsedVersion.Minor())
 }
 
 func driftDRACounterDevice(name, counterSet, counter, amount string) resourcev1.Device {

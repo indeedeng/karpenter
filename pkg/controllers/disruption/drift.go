@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 )
 
 const (
@@ -74,12 +75,12 @@ func (d *Drift) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 
 // ComputeCommand generates a disruption command given candidates
 func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	return d.computeCommands(ctx, DriftTimeoutDuration, disruptionBudgetMapping, candidates...)
-}
+	timeout := time.Duration(0)
+	legacyMode := true
+	if options.FromContext(ctx).FeatureGates.DriftReplacementBatching {
+		legacyMode = false
+		timeout = DriftTimeoutDuration
 
-func (d *Drift) computeCommands(ctx context.Context, timeout time.Duration, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	legacyMode := timeout == 0
-	if !legacyMode {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()

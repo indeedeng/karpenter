@@ -23,13 +23,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/clock"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 )
 
 func TestDriftBatchesEmptyCandidatesWithinBudget(t *testing.T) {
@@ -41,7 +44,7 @@ func TestDriftBatchesEmptyCandidatesWithinBudget(t *testing.T) {
 	}
 	budgets := map[string]int{nodePool.Name: 2}
 
-	commands, err := (&Drift{}).ComputeCommands(context.Background(), budgets, candidates...)
+	commands, err := (&Drift{}).ComputeCommands(driftBatchingContext(true), budgets, candidates...)
 	if err != nil {
 		t.Fatalf("computing commands, %v", err)
 	}
@@ -61,6 +64,27 @@ func TestDriftBatchesEmptyCandidatesWithinBudget(t *testing.T) {
 	}
 }
 
+func TestDriftBatchingFeatureGateRestoresSingleCommand(t *testing.T) {
+	nodePool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	candidates := []*Candidate{
+		newDriftBatchTestCandidate(0, nodePool),
+		newDriftBatchTestCandidate(1, nodePool),
+		newDriftBatchTestCandidate(2, nodePool),
+	}
+	budgets := map[string]int{nodePool.Name: len(candidates)}
+
+	commands, err := (&Drift{}).ComputeCommands(driftBatchingContext(false), budgets, candidates...)
+	if err != nil {
+		t.Fatalf("computing commands, %v", err)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("expected one command with drift batching disabled, got %d", len(commands))
+	}
+	if budgets[nodePool.Name] != len(candidates)-1 {
+		t.Fatalf("expected one budget decrement, got %d remaining", budgets[nodePool.Name])
+	}
+}
+
 func TestDriftCapsEmptyCandidateBatch(t *testing.T) {
 	nodePool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
 	candidates := make([]*Candidate, 0, DriftMaxBatchSize+1)
@@ -69,7 +93,7 @@ func TestDriftCapsEmptyCandidateBatch(t *testing.T) {
 	}
 	budgets := map[string]int{nodePool.Name: len(candidates)}
 
-	commands, err := (&Drift{}).ComputeCommands(context.Background(), budgets, candidates...)
+	commands, err := (&Drift{}).ComputeCommands(driftBatchingContext(true), budgets, candidates...)
 	if err != nil {
 		t.Fatalf("computing commands, %v", err)
 	}
@@ -92,7 +116,7 @@ func TestDriftCapsBatchAcrossNodePools(t *testing.T) {
 		nodePools[1].Name: len(candidates),
 	}
 
-	commands, err := (&Drift{}).ComputeCommands(context.Background(), budgets, candidates...)
+	commands, err := (&Drift{}).ComputeCommands(driftBatchingContext(true), budgets, candidates...)
 	if err != nil {
 		t.Fatalf("computing commands, %v", err)
 	}
@@ -115,7 +139,7 @@ func TestDriftTracksBudgetsIndependentlyAcrossNodePools(t *testing.T) {
 	}
 	budgets := map[string]int{firstNodePool.Name: 1, secondNodePool.Name: 2}
 
-	commands, err := (&Drift{}).ComputeCommands(context.Background(), budgets, candidates...)
+	commands, err := (&Drift{}).ComputeCommands(driftBatchingContext(true), budgets, candidates...)
 	if err != nil {
 		t.Fatalf("computing commands, %v", err)
 	}
@@ -134,7 +158,7 @@ func TestDriftZeroTimeoutStopsAfterFirstAcceptedCommand(t *testing.T) {
 	nonEmpty.reschedulablePods = []*corev1.Pod{{}}
 	budgets := map[string]int{nodePool.Name: 2}
 
-	commands, err := (&Drift{}).computeCommands(context.Background(), 0, budgets, empty, nonEmpty)
+	commands, err := (&Drift{}).ComputeCommands(driftBatchingContext(false), budgets, empty, nonEmpty)
 	if err != nil {
 		t.Fatalf("computing commands, %v", err)
 	}
@@ -156,7 +180,7 @@ func TestDriftZeroTimeoutStopsAfterSkippedCandidates(t *testing.T) {
 	}
 	budgets := map[string]int{skippedNodePool.Name: 0, acceptedNodePool.Name: 2}
 
-	commands, err := (&Drift{}).computeCommands(context.Background(), 0, budgets, candidates...)
+	commands, err := (&Drift{}).ComputeCommands(driftBatchingContext(false), budgets, candidates...)
 	if err != nil {
 		t.Fatalf("computing commands, %v", err)
 	}
@@ -183,8 +207,10 @@ func TestDriftDeadlineReturnsEarlierAcceptedCommands(t *testing.T) {
 			return scheduling.Results{}, nil, ctx.Err()
 		},
 	}
+	ctx, cancel := context.WithTimeout(driftBatchingContext(true), 20*time.Millisecond)
+	defer cancel()
 
-	commands, err := drift.computeCommands(context.Background(), 10*time.Millisecond, budgets, empty, nonEmpty)
+	commands, err := drift.ComputeCommands(ctx, budgets, empty, nonEmpty)
 	if err != nil {
 		t.Fatalf("computing commands, %v", err)
 	}
@@ -208,7 +234,7 @@ func TestDriftNonDeadlineSimulationErrorFailsPass(t *testing.T) {
 		},
 	}
 
-	commands, err := drift.computeCommands(context.Background(), time.Minute, map[string]int{nodePool.Name: 2}, empty, nonEmpty)
+	commands, err := drift.ComputeCommands(driftBatchingContext(true), map[string]int{nodePool.Name: 2}, empty, nonEmpty)
 	if !errors.Is(err, expectedErr) {
 		t.Fatalf("expected simulation error, got %v", err)
 	}
@@ -233,7 +259,7 @@ func TestDriftDiscardsCandidateMarkedDeletingDuringSimulation(t *testing.T) {
 		},
 	}
 
-	commands, err := drift.computeCommands(context.Background(), time.Minute, budgets, candidate)
+	commands, err := drift.ComputeCommands(driftBatchingContext(true), budgets, candidate)
 	if err != nil {
 		t.Fatalf("computing commands, %v", err)
 	}
@@ -252,8 +278,10 @@ func TestDriftExpiredDeadlineReturnsNoNewCommands(t *testing.T) {
 		newDriftBatchTestCandidate(1, nodePool),
 	}
 	budgets := map[string]int{nodePool.Name: len(candidates)}
+	ctx, cancel := context.WithTimeout(driftBatchingContext(true), -time.Second)
+	defer cancel()
 
-	commands, err := (&Drift{}).computeCommands(context.Background(), -time.Second, budgets, candidates...)
+	commands, err := (&Drift{}).ComputeCommands(ctx, budgets, candidates...)
 	if err != nil {
 		t.Fatalf("computing commands, %v", err)
 	}
@@ -274,4 +302,11 @@ func newDriftBatchTestCandidate(index int, nodePool *v1.NodePool) *Candidate {
 		StateNode: stateNode,
 		NodePool:  nodePool,
 	}
+}
+
+func driftBatchingContext(enabled bool) context.Context {
+	ctx := options.ToContext(context.Background(), &options.Options{
+		FeatureGates: options.FeatureGates{DriftReplacementBatching: enabled},
+	})
+	return log.IntoContext(ctx, logr.Discard())
 }
