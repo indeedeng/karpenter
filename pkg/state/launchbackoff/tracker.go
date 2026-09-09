@@ -14,30 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package launchbackoff bounds how often Karpenter re-attempts a launch that failed for
-// insufficient capacity. It holds two kinds of state, both written only from observed launch
-// outcomes:
-//
-//   - Per-offering backoff, which marks a capacity pool unavailable for an exponentially
-//     growing window after an ICE. This is a filter: it decides whether an offering may be
-//     tried at all, not how fast.
-//   - Per-NodePool launch budgets, which decide how fast. An aggregate budget engages while a
-//     pool is constrained by a recent failure; a risky budget always applies to NodeClaims
-//     whose every usable offering has a failure history, including on a released pool.
-//
-// The tracker is shared, mutable state constructed once and injected by pointer into several
-// independently concurrent controllers, so every method is safe for concurrent use. Reads
-// never mutate: only Fail, Succeed, FailPool, SucceedPool, Admit, Delete, and GC change
-// anything.
+// Package launchbackoff bounds insufficient-capacity retries with a refill-window budget
+// for each cloud-provider offering. NodeClaims reserve compatible offerings before creation
+// and settle the reservation after the provider reports the actual outcome.
 package launchbackoff
 
 import (
 	"context"
-	"math/rand"
+	"sort"
 	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -45,442 +34,477 @@ import (
 )
 
 const (
-	// BaseDelay is the nominal first backoff window for an offering. It is not chosen to
-	// outlast any provider's own ICE cache: usability is the intersection of provider and core
-	// availability, so the longer gate binds and at low levels that is the provider. What core
-	// windows buy is escalation past a provider's fixed TTL at higher levels, and per-offering
-	// isolation that a per-NodePool budget cannot express.
-	BaseDelay = 30 * time.Second
-	// MaxDelay is the ceiling on a single offering window, and also the idle period after
-	// which an entry is discarded entirely.
-	MaxDelay = 10 * time.Minute
-	// ProbeInterval is the window length for both NodePool budgets. It is independent of
-	// BaseDelay so that a pool with hundreds of backed-off offerings cannot emit hundreds of
-	// launches when their windows line up.
 	ProbeInterval = 30 * time.Second
-	// BurstMax is the aggregate allowance a recovering pool must exceed before it is released
-	// outright. It caps wasted launches after a spurious recovery.
-	BurstMax = 8
-	// RiskyBurst is how many launches per window are allowed for NodeClaims with no healthy
-	// offering to land on. This budget deliberately does not ramp: recovery is expressed by
-	// offering entries clearing, which makes such NodeClaims stop being risky.
-	RiskyBurst = 1
-	// maxLevel caps escalation so that the window shift cannot overflow. The window is capped
-	// at MaxDelay well before this.
-	maxLevel = 20
+	BurstMax      = 8
+	EntryTTL      = 10 * time.Minute
+
+	defaultUnboundReservationTTL = 10 * time.Minute
 )
 
-// offeringEntry is the backoff state for one capacity pool. An entry exists only for an
-// offering that has failed at least once.
 type offeringEntry struct {
-	// level counts consecutive failed windows, not individual failures.
-	level int
-	// until is when the offering becomes eligible again. The entry itself is discarded at
-	// until+MaxDelay, which is what keeps level meaning "recent" history.
-	until time.Time
+	incarnation uint64
+	burst       int
+	remaining   int
+	nextRefill  time.Time
+	generation  uint64
+	epoch       uint64
+	lastRamp    *uint64
+	lastFailure *uint64
+	lastActive  time.Time
 }
 
-// poolEntry holds both launch budgets for one NodePool.
-type poolEntry struct {
-	// constrained reports whether the aggregate budget is engaged.
-	constrained bool
-	// burst is the allowance ceiling at the current recovery level. It changes only on
-	// SucceedPool and FailPool, never on admission, so it graphs as a recovery ramp.
-	burst int
-	// remaining is the allowance left in the current window. Distinct from burst: consuming
-	// burst directly would erode the ceiling.
-	remaining int
-	nextAdmit time.Time
+type reservationStamp struct {
+	incarnation uint64
+	generation  uint64
+	epoch       uint64
+	debited     bool
+}
 
-	riskyRemaining int
-	nextRiskyAdmit time.Time
+type reservation struct {
+	keys      map[cloudprovider.OfferingKey]reservationStamp
+	expiresAt time.Time
+	nodeClaim types.UID
+}
+
+type ReservationResult struct {
+	Admitted         bool
+	NextEligible     time.Time
+	DebitedOfferings int
+}
+
+type OfferingBudget struct {
+	Burst       int
+	Unavailable bool
 }
 
 type Tracker struct {
-	mu        sync.RWMutex
-	clock     clock.Clock
-	offerings map[cloudprovider.OfferingKey]*offeringEntry
-	pools     map[types.UID]*poolEntry
+	mu                    sync.RWMutex
+	clock                 clock.Clock
+	offerings             map[cloudprovider.OfferingKey]*offeringEntry
+	reservations          map[string]*reservation
+	nextIncarnation       uint64
+	unboundReservationTTL time.Duration
 }
 
-func NewTracker(clk clock.Clock) *Tracker {
+func NewTracker(clk clock.Clock, unboundReservationTTL ...time.Duration) *Tracker {
+	ttl := defaultUnboundReservationTTL
+	if len(unboundReservationTTL) != 0 {
+		ttl = unboundReservationTTL[0]
+	}
 	return &Tracker{
-		clock:     clk,
-		offerings: map[cloudprovider.OfferingKey]*offeringEntry{},
-		pools:     map[types.UID]*poolEntry{},
+		clock:                 clk,
+		offerings:             map[cloudprovider.OfferingKey]*offeringEntry{},
+		reservations:          map[string]*reservation{},
+		unboundReservationTTL: ttl,
 	}
 }
 
-// enabled reports whether the LaunchBackoff feature gate is on.
-//
-// The gate is read per call rather than captured at construction so that it stays overridable
-// through the context, which is how the rest of the codebase gates behavior and how tests
-// flip features per spec. Every method that decides or mutates checks this, which keeps the
-// gate out of the call sites: with the feature off a Tracker answers as though nothing has
-// ever failed and records nothing.
 func enabled(ctx context.Context) bool {
 	return options.FromContext(ctx).FeatureGates.LaunchBackoff
 }
 
-// expired reports whether an entry has been eligible for long enough to discard. Expiry is
-// evaluated lazily so that reads stay non-mutating; GC does the actual deletion.
-func (t *Tracker) expired(e *offeringEntry, now time.Time) bool {
-	return !now.Before(e.until.Add(MaxDelay))
-}
-
-// live returns the entry for a key if one exists and has not expired.
-func (t *Tracker) live(key cloudprovider.OfferingKey, now time.Time) (*offeringEntry, bool) {
-	e, ok := t.offerings[key]
-	if !ok || t.expired(e, now) {
-		return nil, false
-	}
-	return e, true
-}
-
-// Empty reports whether the tracker holds no offering state at all. FilterUnavailable uses
-// this to return the provider's slice untouched on a cluster that has never failed a launch.
 func (t *Tracker) Empty() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-
 	return len(t.offerings) == 0
 }
 
-// UnavailableOfferings returns the keys currently inside a backoff window. Offerings whose
-// window has elapsed are omitted even though their history is still remembered, so the result is
-// "what is blocked right now" rather than "what has ever failed".
-//
-// A snapshot rather than a callback so that the caller never holds the lock while it builds
-// metric series, and cannot deadlock by calling back into the tracker.
-func (t *Tracker) UnavailableOfferings() []cloudprovider.OfferingKey {
+// IsAvailable is intentionally read-only. A due refill is treated as available, while the
+// first Reserve that reaches it performs the actual refill under the write lock.
+func (t *Tracker) IsAvailable(key cloudprovider.OfferingKey) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	entry, ok := t.offerings[key]
+	return !ok || entry.remaining > 0 || !t.clock.Now().Before(entry.nextRefill)
+}
+
+func (t *Tracker) NextEligible(key cloudprovider.OfferingKey) time.Time {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	now := t.clock.Now()
-	keys := []cloudprovider.OfferingKey{}
-	for key := range t.offerings {
-		if e, ok := t.live(key, now); ok && now.Before(e.until) {
+	entry, ok := t.offerings[key]
+	if !ok || entry.remaining > 0 || !now.Before(entry.nextRefill) {
+		return now
+	}
+	return entry.nextRefill
+}
+
+func (t *Tracker) Reserve(ctx context.Context, id string, candidates []cloudprovider.OfferingKey) ReservationResult {
+	if !enabled(ctx) {
+		return ReservationResult{Admitted: true, NextEligible: t.clock.Now()}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.cleanupLocked()
+	return t.reserveLocked(id, candidates)
+}
+
+// ReserveBatch commits reservations only when every request can be admitted. Requests with
+// fewer currently launchable candidates are evaluated first to avoid consuming a flexible
+// request's allowance before a constrained replacement.
+func (t *Tracker) ReserveBatch(ctx context.Context, candidates map[string][]cloudprovider.OfferingKey) (map[string]ReservationResult, bool) {
+	if !enabled(ctx) {
+		results := make(map[string]ReservationResult, len(candidates))
+		for id := range candidates {
+			results[id] = ReservationResult{Admitted: true, NextEligible: t.clock.Now()}
+		}
+		return results, true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.cleanupLocked()
+	type request struct {
+		id         string
+		candidates []cloudprovider.OfferingKey
+		launchable int
+	}
+	requests := make([]request, 0, len(candidates))
+	for id, keys := range candidates {
+		requests = append(requests, request{id: id, candidates: keys, launchable: t.launchableLocked(keys)})
+	}
+	sort.Slice(requests, func(i, j int) bool {
+		if requests[i].launchable == requests[j].launchable {
+			return requests[i].id < requests[j].id
+		}
+		return requests[i].launchable < requests[j].launchable
+	})
+
+	results := make(map[string]ReservationResult, len(candidates))
+	var committed []string
+	for _, request := range requests {
+		result := t.reserveLocked(request.id, request.candidates)
+		results[request.id] = result
+		if !result.Admitted {
+			for _, id := range committed {
+				t.releaseLocked(id)
+			}
+			for _, batchRequest := range requests {
+				batchResult := results[batchRequest.id]
+				batchResult.Admitted = false
+				batchResult.DebitedOfferings = 0
+				batchResult.NextEligible = result.NextEligible
+				results[batchRequest.id] = batchResult
+			}
+			return results, false
+		}
+		committed = append(committed, request.id)
+	}
+	return results, true
+}
+
+func (t *Tracker) reserveLocked(id string, candidates []cloudprovider.OfferingKey) ReservationResult {
+	now := t.clock.Now()
+	if len(t.offerings) == 0 {
+		return ReservationResult{Admitted: true, NextEligible: now}
+	}
+
+	keys := uniqueKeys(candidates)
+	if len(keys) == 0 {
+		return ReservationResult{Admitted: false, NextEligible: now.Add(ProbeInterval)}
+	}
+
+	stamps := make(map[cloudprovider.OfferingKey]reservationStamp, len(keys))
+	admitted := false
+	nextEligible := time.Time{}
+	debited := 0
+	for _, key := range keys {
+		entry, ok := t.offerings[key]
+		if !ok {
+			stamps[key] = reservationStamp{}
+			admitted = true
+			continue
+		}
+		t.refillLocked(entry, now)
+		entry.lastActive = now
+		stamp := reservationStamp{
+			incarnation: entry.incarnation,
+			generation:  entry.generation,
+			epoch:       entry.epoch,
+		}
+		if entry.remaining > 0 {
+			entry.remaining--
+			stamp.debited = true
+			admitted = true
+			debited++
+		} else if nextEligible.IsZero() || entry.nextRefill.Before(nextEligible) {
+			nextEligible = entry.nextRefill
+		}
+		stamps[key] = stamp
+	}
+	if !admitted {
+		return ReservationResult{Admitted: false, NextEligible: nextEligible}
+	}
+	t.reservations[id] = &reservation{
+		keys:      stamps,
+		expiresAt: now.Add(t.unboundReservationTTL),
+	}
+	return ReservationResult{Admitted: true, NextEligible: now, DebitedOfferings: debited}
+}
+
+func (t *Tracker) launchableLocked(candidates []cloudprovider.OfferingKey) int {
+	now := t.clock.Now()
+	launchable := 0
+	for _, key := range uniqueKeys(candidates) {
+		entry, ok := t.offerings[key]
+		if !ok {
+			launchable++
+			continue
+		}
+		t.refillLocked(entry, now)
+		if entry.remaining > 0 {
+			launchable++
+		}
+	}
+	return launchable
+}
+
+func (t *Tracker) Bind(id string, nodeClaim types.UID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if r, ok := t.reservations[id]; ok {
+		r.nodeClaim = nodeClaim
+		r.expiresAt = time.Time{}
+	}
+}
+
+func (t *Tracker) Release(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.releaseLocked(id)
+}
+
+func (t *Tracker) releaseLocked(id string) {
+	r, ok := t.reservations[id]
+	if !ok {
+		return
+	}
+	for key, stamp := range r.keys {
+		t.refundLocked(key, stamp)
+	}
+	delete(t.reservations, id)
+}
+
+func (t *Tracker) Fail(ctx context.Context, id string, keys ...cloudprovider.OfferingKey) {
+	if !enabled(ctx) {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := t.clock.Now()
+	t.cleanupLocked()
+	r, hasReservation := t.reservations[id]
+	failed := uniqueKeys(keys)
+	if len(failed) == 0 && hasReservation {
+		failed = make([]cloudprovider.OfferingKey, 0, len(r.keys))
+		for key := range r.keys {
+			failed = append(failed, key)
+		}
+	}
+	failedSet := make(map[cloudprovider.OfferingKey]struct{}, len(failed))
+	for _, key := range failed {
+		failedSet[key] = struct{}{}
+	}
+	if hasReservation {
+		for key, stamp := range r.keys {
+			if _, ok := failedSet[key]; !ok {
+				t.refundLocked(key, stamp)
+			}
+		}
+		delete(t.reservations, id)
+	}
+	for _, key := range failed {
+		t.failLocked(key, now)
+	}
+}
+
+func (t *Tracker) failLocked(key cloudprovider.OfferingKey, now time.Time) {
+	entry, ok := t.offerings[key]
+	if !ok {
+		t.nextIncarnation++
+		generation := uint64(0)
+		t.offerings[key] = &offeringEntry{
+			incarnation: t.nextIncarnation,
+			burst:       1,
+			remaining:   0,
+			nextRefill:  now.Add(ProbeInterval),
+			epoch:       1,
+			lastFailure: &generation,
+			lastActive:  now,
+		}
+		return
+	}
+	t.refillLocked(entry, now)
+	entry.lastActive = now
+	if entry.lastFailure == nil || *entry.lastFailure != entry.generation {
+		entry.epoch++
+		generation := entry.generation
+		entry.lastFailure = &generation
+	}
+	if entry.burst != 1 || entry.remaining != 0 {
+		entry.burst = 1
+		entry.remaining = 0
+		entry.nextRefill = now.Add(ProbeInterval)
+	}
+}
+
+func (t *Tracker) Succeed(ctx context.Context, id string, landed cloudprovider.OfferingKey) {
+	if !enabled(ctx) {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.cleanupLocked()
+	r, ok := t.reservations[id]
+	if !ok {
+		return
+	}
+	for key, stamp := range r.keys {
+		if key != landed {
+			t.refundLocked(key, stamp)
+		}
+	}
+	stamp, trackedCandidate := r.keys[landed]
+	entry, trackedEntry := t.offerings[landed]
+	if trackedCandidate && trackedEntry &&
+		entry.incarnation == stamp.incarnation &&
+		entry.generation == stamp.generation &&
+		entry.epoch == stamp.epoch &&
+		(entry.lastFailure == nil || *entry.lastFailure != entry.generation) &&
+		(entry.lastRamp == nil || *entry.lastRamp != entry.generation) {
+		entry.lastActive = t.clock.Now()
+		if entry.burst*2 > BurstMax {
+			delete(t.offerings, landed)
+		} else {
+			entry.burst *= 2
+			generation := entry.generation
+			entry.lastRamp = &generation
+		}
+	}
+	delete(t.reservations, id)
+}
+
+func (t *Tracker) refundLocked(key cloudprovider.OfferingKey, stamp reservationStamp) {
+	if !stamp.debited {
+		return
+	}
+	entry, ok := t.offerings[key]
+	if !ok ||
+		entry.incarnation != stamp.incarnation ||
+		entry.generation != stamp.generation ||
+		entry.epoch != stamp.epoch {
+		return
+	}
+	if entry.remaining < entry.burst {
+		entry.remaining++
+	}
+}
+
+func (t *Tracker) refillLocked(entry *offeringEntry, now time.Time) {
+	if now.Before(entry.nextRefill) {
+		return
+	}
+	entry.remaining = entry.burst
+	entry.nextRefill = now.Add(ProbeInterval)
+	entry.generation++
+}
+
+func (t *Tracker) Cleanup() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.cleanupLocked()
+}
+
+// BoundReservations returns a snapshot used to reconcile reservations against live NodeClaims.
+// ReleaseOrphanedBoundReservations checks the snapshot again before releasing so a reservation
+// bound after this call cannot be removed based on an older API-server list.
+func (t *Tracker) BoundReservations() map[string]types.UID {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	result := map[string]types.UID{}
+	for id, r := range t.reservations {
+		if r.nodeClaim != "" {
+			result[id] = r.nodeClaim
+		}
+	}
+	return result
+}
+
+// ReleaseOrphanedBoundReservations releases reservations from the observed snapshot whose
+// NodeClaim UIDs are no longer live.
+func (t *Tracker) ReleaseOrphanedBoundReservations(observed map[string]types.UID, liveNodeClaims sets.Set[types.UID]) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for id, observedUID := range observed {
+		r, ok := t.reservations[id]
+		if ok && r.nodeClaim == observedUID && !liveNodeClaims.Has(observedUID) {
+			t.releaseLocked(id)
+		}
+	}
+}
+
+// GC is retained as a compatibility alias for existing controller wiring while callers move
+// to the reservation-oriented name.
+func (t *Tracker) GC() {
+	t.Cleanup()
+}
+
+func (t *Tracker) cleanupLocked() {
+	now := t.clock.Now()
+	for id, r := range t.reservations {
+		if r.nodeClaim == "" && !r.expiresAt.IsZero() && !now.Before(r.expiresAt) {
+			t.releaseLocked(id)
+		}
+	}
+	for key, entry := range t.offerings {
+		if !now.Before(entry.lastActive.Add(EntryTTL)) {
+			delete(t.offerings, key)
+		}
+	}
+}
+
+func (t *Tracker) Budgets() map[cloudprovider.OfferingKey]OfferingBudget {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	now := t.clock.Now()
+	result := make(map[cloudprovider.OfferingKey]OfferingBudget, len(t.offerings))
+	for key, entry := range t.offerings {
+		result[key] = OfferingBudget{
+			Burst:       entry.burst,
+			Unavailable: entry.remaining == 0 && now.Before(entry.nextRefill),
+		}
+	}
+	return result
+}
+
+func (t *Tracker) UnavailableOfferings() []cloudprovider.OfferingKey {
+	budgets := t.Budgets()
+	keys := make([]cloudprovider.OfferingKey, 0, len(budgets))
+	for key, budget := range budgets {
+		if budget.Unavailable {
 			keys = append(keys, key)
 		}
 	}
 	return keys
 }
 
-// ConstrainedPools returns the burst ceiling of every NodePool whose aggregate budget is engaged.
-//
-// The ceiling rather than the remaining allowance: remaining is consumed and refilled every
-// window, so graphing it would show a sawtooth and hide whether the pool is recovering (rising)
-// or stuck at the floor (pinned at 1).
-func (t *Tracker) ConstrainedPools() map[types.UID]int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	pools := map[types.UID]int{}
-	for uid, p := range t.pools {
-		if p.constrained {
-			pools[uid] = p.burst
+func uniqueKeys(keys []cloudprovider.OfferingKey) []cloudprovider.OfferingKey {
+	seen := make(map[cloudprovider.OfferingKey]struct{}, len(keys))
+	result := make([]cloudprovider.OfferingKey, 0, len(keys))
+	for _, key := range keys {
+		if _, ok := seen[key]; ok {
+			continue
 		}
+		seen[key] = struct{}{}
+		result = append(result, key)
 	}
-	return pools
-}
-
-// IsAvailable reports whether core will allow an attempt on this offering. True when the
-// offering has no history, when its history has expired, or when its window has elapsed.
-//
-// This is a clock comparison, not a reservation: it does not and cannot limit how many
-// NodeClaims are launched onto a newly eligible offering. That bound comes from the risky
-// budget in Admit.
-func (t *Tracker) IsAvailable(key cloudprovider.OfferingKey) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	now := t.clock.Now()
-	e, ok := t.live(key, now)
-	if !ok {
-		return true
-	}
-	return !now.Before(e.until)
-}
-
-// HasFailed reports whether this offering has unexpired failure history, whether or not its
-// window has elapsed. This is a different question from IsAvailable, which is also true for
-// an offering whose window just elapsed: admission ordering needs "never failed", not
-// "allowed to try".
-func (t *Tracker) HasFailed(key cloudprovider.OfferingKey) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	_, ok := t.live(key, t.clock.Now())
-	return ok
-}
-
-// NextEligible returns when this offering becomes eligible for another attempt. For an
-// offering with no live history, or one whose window has already elapsed, that is now.
-func (t *Tracker) NextEligible(key cloudprovider.OfferingKey) time.Time {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	now := t.clock.Now()
-	e, ok := t.live(key, now)
-	if !ok || !now.Before(e.until) {
-		return now
-	}
-	return e.until
-}
-
-// Fail records an observed insufficient-capacity failure for an offering. It is idempotent
-// inside a window: a burst of in-flight failures for the same key arms backoff once, so
-// escalation tracks failed windows rather than individual attempts.
-func (t *Tracker) Fail(ctx context.Context, key cloudprovider.OfferingKey) {
-	if !enabled(ctx) {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	now := t.clock.Now()
-	e, ok := t.live(key, now)
-	if !ok {
-		// Absent or expired: start over rather than resuming an old escalation.
-		t.offerings[key] = &offeringEntry{level: 1, until: now.Add(window(1))}
-		return
-	}
-	if now.Before(e.until) {
-		return
-	}
-	if e.level < maxLevel {
-		e.level++
-	}
-	e.until = now.Add(window(e.level))
-}
-
-// Succeed records an observed successful launch, clearing the offering's history. A NodeClaim
-// that was risky because of this key stops being risky on the next scheduling loop, which is
-// how recovery propagates without the risky budget needing a ramp.
-func (t *Tracker) Succeed(ctx context.Context, key cloudprovider.OfferingKey) {
-	if !enabled(ctx) {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	delete(t.offerings, key)
-}
-
-// window returns the equal-jittered backoff for a given escalation level.
-func window(level int) time.Duration {
-	w := BaseDelay << (level - 1)
-	if w > MaxDelay || w <= 0 {
-		w = MaxDelay
-	}
-	half := w / 2
-	if half <= 0 {
-		return w
-	}
-	//nolint:gosec // jitter does not need a cryptographic source
-	return half + time.Duration(rand.Int63n(int64(half)))
-}
-
-// IsConstrained reports whether a NodePool's aggregate budget is engaged. It is read-only:
-// disruption peeks with this so that an opportunistic replacement never consumes a probe that
-// pending pods are waiting for. Deliberately not named CanAdmit, because it is not a
-// prediction of what Admit would return — it refuses a constrained pool even when window
-// allowance remains.
-func (t *Tracker) IsConstrained(ctx context.Context, nodePoolUID types.UID) bool {
-	if !enabled(ctx) {
-		return false
-	}
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	p, ok := t.pools[nodePoolUID]
-	return ok && p.constrained
-}
-
-// FailPool engages the aggregate budget for a NodePool at its floor. Idempotent inside a
-// window, matching Fail.
-func (t *Tracker) FailPool(ctx context.Context, nodePoolUID types.UID) {
-	// An empty UID is a NodeClaim with no owning NodePool. Recording it would collect every such
-	// NodeClaim into one shared budget that no NodePool can ever clear.
-	if !enabled(ctx) || nodePoolUID == "" {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	now := t.clock.Now()
-	p, ok := t.pools[nodePoolUID]
-	if !ok {
-		p = &poolEntry{}
-		t.pools[nodePoolUID] = p
-	}
-	if p.constrained && now.Before(p.nextAdmit) {
-		return
-	}
-	p.constrained = true
-	p.burst = 1
-	p.remaining = 1
-	p.nextAdmit = now.Add(ProbeInterval)
-}
-
-// SucceedPool ramps a constrained NodePool's allowance. Doubling rather than releasing on the
-// first success bounds the overshoot to BurstMax when capacity has only marginally returned,
-// while still reaching full speed in a few windows when it genuinely has.
-func (t *Tracker) SucceedPool(ctx context.Context, nodePoolUID types.UID) {
-	if !enabled(ctx) || nodePoolUID == "" {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	p, ok := t.pools[nodePoolUID]
-	if !ok || !p.constrained {
-		return
-	}
-	if p.burst*2 > BurstMax {
-		p.constrained = false
-		p.burst = 0
-		p.remaining = 0
-		return
-	}
-	p.burst *= 2
-}
-
-// rollover refills the windows that gate this admission and whose deadline has passed. Caller
-// holds the write lock.
-//
-// Only applicable gates are touched: refreshing the risky window on every ordinary admission
-// would keep a long-since-recovered NodePool's entry perpetually young, so GC would never
-// reclaim it or its metric series.
-func (t *Tracker) rollover(p *poolEntry, now time.Time, risky bool) {
-	if p.constrained && !now.Before(p.nextAdmit) {
-		p.remaining = p.burst
-		p.nextAdmit = now.Add(ProbeInterval)
-	}
-	if risky && !now.Before(p.nextRiskyAdmit) {
-		p.riskyRemaining = RiskyBurst
-		p.nextRiskyAdmit = now.Add(ProbeInterval)
-	}
-}
-
-// Admit decides whether one NodeClaim may be created for a NodePool, consuming allowance when
-// it says yes. risky must be true when every usable offering in the NodeClaim's compatible set
-// has failure history, meaning it has nowhere healthy to land.
-//
-// Every applicable gate is evaluated before any is consumed. Decrementing the aggregate
-// allowance and then rejecting on the risky gate would burn a constrained pool's window on a
-// launch that never happens, which one caller can use up on behalf of another.
-func (t *Tracker) Admit(ctx context.Context, nodePoolUID types.UID, risky bool) bool {
-	if !enabled(ctx) {
-		return true
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	now := t.clock.Now()
-	p, ok := t.pools[nodePoolUID]
-	if !ok {
-		if !risky {
-			// Nothing to enforce, and no reason to allocate state for a healthy pool.
-			return true
-		}
-		// A pool that has never failed a launch itself can still have risky NodeClaims,
-		// because offering entries are shared across NodePools.
-		p = &poolEntry{}
-		t.pools[nodePoolUID] = p
-	}
-	t.rollover(p, now, risky)
-
-	if p.constrained && p.remaining == 0 {
-		return false
-	}
-	if risky && p.riskyRemaining == 0 {
-		return false
-	}
-	if p.constrained {
-		p.remaining--
-	}
-	if risky {
-		p.riskyRemaining--
-	}
-	return true
-}
-
-// NextAdmit returns when a NodeClaim rejected by Admit could next be admitted. It takes the
-// same risky argument and returns the latest of the gates that apply, because waking at an
-// earlier gate that was not what blocked this NodeClaim buys a loop that admits nothing.
-func (t *Tracker) NextAdmit(nodePoolUID types.UID, risky bool) time.Time {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	now := t.clock.Now()
-	p, ok := t.pools[nodePoolUID]
-	if !ok {
-		return now
-	}
-	next := now
-	if p.constrained && p.nextAdmit.After(next) {
-		next = p.nextAdmit
-	}
-	if risky && p.nextRiskyAdmit.After(next) {
-		next = p.nextRiskyAdmit
-	}
-	return next
-}
-
-// Burst reports a NodePool's current aggregate ceiling, for metrics. Zero means unconstrained.
-func (t *Tracker) Burst(nodePoolUID types.UID) int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	if p, ok := t.pools[nodePoolUID]; ok && p.constrained {
-		return p.burst
-	}
-	return 0
-}
-
-// Delete drops all budget state for a NodePool. Called when the NodePool is deleted so that
-// entries and their metric series do not outlive it.
-func (t *Tracker) Delete(nodePoolUID types.UID) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	delete(t.pools, nodePoolUID)
-}
-
-// GC discards state that has gone quiet: offerings eligible for longer than MaxDelay, and
-// NodePools whose budget windows have gone untouched for as long. Without this an offering
-// that fails once and is never requested again keeps its level forever, so its next failure
-// months later would start at the MaxDelay ceiling and its metric series would never be
-// dropped.
-//
-// Quiet is the only deletion signal for NodePools, including deleted ones. A NodePool that no
-// longer exists stops being admitted to, so its windows stop advancing and it ages out here.
-// Reacting to the deletion event directly is not an option: the informer only has the object
-// name once it is gone, and this map is keyed by UID precisely so that deleting and recreating
-// a NodePool under the same name does not inherit its backoff.
-//
-// A constrained NodePool is reclaimed on the same terms rather than pinned, because after
-// MaxDelay with nothing asking to launch, "this pool recently failed" is no longer true. The
-// next failure re-arms it immediately, and this is the same staleness rule the offering
-// windows use.
-func (t *Tracker) GC() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	now := t.clock.Now()
-	for key, e := range t.offerings {
-		if t.expired(e, now) {
-			delete(t.offerings, key)
-		}
-	}
-	for uid, p := range t.pools {
-		quietSince := p.nextRiskyAdmit
-		if p.nextAdmit.After(quietSince) {
-			quietSince = p.nextAdmit
-		}
-		if !now.Before(quietSince.Add(MaxDelay)) {
-			delete(t.pools, uid)
-		}
-	}
+	return result
 }

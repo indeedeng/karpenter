@@ -142,7 +142,11 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 	if !nodeclaimutils.IsManaged(nodeClaim, c.cloudProvider) {
 		return reconcile.Result{}, nil
 	}
+	if id := nodeClaim.Annotations[v1.LaunchBackoffReservationAnnotationKey]; id != "" {
+		c.launch.launchBackoff.Bind(id, nodeClaim.UID)
+	}
 	if !nodeClaim.DeletionTimestamp.IsZero() {
+		c.launch.launchBackoff.Release(nodeClaim.Annotations[v1.LaunchBackoffReservationAnnotationKey])
 		return c.finalize(ctx, nodeClaim)
 	}
 

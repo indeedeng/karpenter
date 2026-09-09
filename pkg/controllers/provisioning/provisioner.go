@@ -34,8 +34,10 @@ import (
 	"go.uber.org/multierr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
@@ -68,6 +70,12 @@ import (
 type LaunchOptions struct {
 	RecordPodNomination bool
 	Reason              string
+}
+
+type ReservationResults struct {
+	Admitted     []*scheduler.NodeClaim
+	Omitted      []*scheduler.NodeClaim
+	NextEligible time.Time
 }
 
 // RecordPodNomination causes nominate pod events to be recorded against the node.
@@ -131,9 +139,8 @@ func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
 func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, err error) {
 	ctx = injection.WithControllerName(ctx, p.Name())
 
-	// Reclaim launch backoff state that has gone quiet. This rides the provisioning loop rather
-	// than a controller of its own because it is a small map sweep and this is the only
-	// singleton that already runs on the cadence the backoff windows are measured in.
+	// Reclaim idle offering entries and expired unbound reservations. This is a small map sweep
+	// which can ride the existing provisioning singleton.
 	p.launchBackoff.GC()
 
 	// Batch pods
@@ -165,63 +172,149 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 		p.cluster.UpdateBufferPodCounts(bufferPodCountsFromResults(results))
 	}
 	if len(results.NewNodeClaims) == 0 {
-		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+		return p.requeueForSchedulingResults(results, ReservationResults{}), nil
 	}
-	// Consumed here rather than inside CreateNodeClaims: that function is shared with the disruption
-	// queue, which requires len(names) == len(replacements) after its candidates may already be
-	// cordoned, so it must never silently omit.
-	//
-	// Omitted NodeClaims need no requeue of their own. Their pods stay provisionable, and the pod
-	// controller re-triggers this loop every 10s — sooner than any backoff window elapses.
-	admitted := p.admit(ctx, results.NewNodeClaims)
-	if len(admitted) == 0 {
-		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+	reservations, err := p.ReserveNodeClaims(ctx, results.NewNodeClaims)
+	if err != nil {
+		return reconciler.Result{}, err
 	}
-	if _, err = p.CreateNodeClaims(ctx, admitted, WithReason(metrics.ProvisionedReason), RecordPodNomination); err != nil {
+	if len(reservations.Admitted) == 0 {
+		return p.requeueForSchedulingResults(results, reservations), nil
+	}
+	if _, err = p.CreateNodeClaims(ctx, reservations.Admitted, WithReason(metrics.ProvisionedReason), RecordPodNomination); err != nil {
 		return reconciler.Result{}, err
 	}
 	return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 }
 
-// admit returns the NodeClaims the per-NodePool launch budgets allow this round.
-//
-// Non-risky NodeClaims are offered first. A NodeClaim with at least one offering that has not failed
-// recently should not queue behind probes for pools already known to be short, otherwise a shortage
-// in one zone throttles the launches that would have succeeded in another. The same walk supplies
-// both the ordering and the risky argument, so there is no second pass, and it is skipped entirely
-// when the tracker holds no offering state.
-func (p *Provisioner) admit(ctx context.Context, nodeClaims []*scheduler.NodeClaim) []*scheduler.NodeClaim {
-	risky := make([]bool, len(nodeClaims))
-	order := make([]int, 0, len(nodeClaims))
-	for i, nc := range nodeClaims {
-		risky[i] = p.launchBackoff.IsRisky(ctx, nc.InstanceTypeOptions)
-		if !risky[i] {
-			order = append(order, i)
+func (p *Provisioner) ReserveNodeClaims(ctx context.Context, nodeClaims []*scheduler.NodeClaim) (ReservationResults, error) {
+	return p.reserveNodeClaims(ctx, nodeClaims, false)
+}
+
+func (p *Provisioner) ReserveReplacementNodeClaims(ctx context.Context, nodeClaims []*scheduler.NodeClaim) (ReservationResults, error) {
+	return p.reserveNodeClaims(ctx, nodeClaims, true)
+}
+
+func (p *Provisioner) reserveNodeClaims(ctx context.Context, nodeClaims []*scheduler.NodeClaim, atomic bool) (ReservationResults, error) {
+	if !options.FromContext(ctx).FeatureGates.LaunchBackoff || p.launchBackoff.Empty() {
+		return ReservationResults{Admitted: nodeClaims}, nil
+	}
+
+	instanceTypes := map[string][]*cloudprovider.InstanceType{}
+	candidates := make(map[string][]cloudprovider.OfferingKey, len(nodeClaims))
+	claimsByID := make(map[string]*scheduler.NodeClaim, len(nodeClaims))
+	ids := make([]string, 0, len(nodeClaims))
+	for _, nodeClaim := range nodeClaims {
+		its, ok := instanceTypes[nodeClaim.NodePoolName]
+		if !ok {
+			nodePool := &v1.NodePool{}
+			if err := p.kubeClient.Get(ctx, client.ObjectKey{Name: nodeClaim.NodePoolName}, nodePool); err != nil {
+				return ReservationResults{}, fmt.Errorf("getting nodepool for launch reservation, %w", err)
+			}
+			var err error
+			its, err = p.cloudProvider.GetInstanceTypes(ctx, nodePool)
+			if err != nil {
+				return ReservationResults{}, fmt.Errorf("getting instance types for launch reservation, %w", err)
+			}
+			instanceTypes[nodeClaim.NodePoolName] = its
+		}
+		id := string(uuid.NewUUID())
+		ids = append(ids, id)
+		candidates[id] = launchbackoff.CandidateOfferings(nodeClaim.ToNodeClaim(), its)
+		claimsByID[id] = nodeClaim
+	}
+
+	results := ReservationResults{}
+	reservationResults := map[string]launchbackoff.ReservationResult{}
+	if atomic {
+		var admitted bool
+		reservationResults, admitted = p.launchBackoff.ReserveBatch(ctx, candidates)
+		if !admitted {
+			for id, nodeClaim := range claimsByID {
+				results.Omitted = append(results.Omitted, nodeClaim)
+				results.NextEligible = earliest(results.NextEligible, reservationResults[id].NextEligible)
+				capacityType := launchbackoff.ThrottledCapacityType(lo.Uniq(lo.Map(candidates[id], func(key cloudprovider.OfferingKey, _ int) string {
+					return key.CapacityType
+				})))
+				launchbackoff.NodePoolsLaunchThrottledTotal.Inc(map[string]string{
+					metrics.NodePoolLabel:     nodeClaim.NodePoolName,
+					metrics.ReasonLabel:       launchbackoff.ThrottledReasonOfferingBudget,
+					metrics.CapacityTypeLabel: capacityType,
+				})
+			}
+			return results, nil
+		}
+	} else {
+		for _, id := range ids {
+			reservationResults[id] = p.launchBackoff.Reserve(ctx, id, candidates[id])
 		}
 	}
-	for i := range nodeClaims {
-		if risky[i] {
-			order = append(order, i)
-		}
-	}
-	admitted := make([]*scheduler.NodeClaim, 0, len(nodeClaims))
-	for _, i := range order {
-		if p.launchBackoff.Admit(ctx, nodeClaims[i].NodePoolUUID, risky[i]) {
-			admitted = append(admitted, nodeClaims[i])
+
+	for _, id := range ids {
+		nodeClaim := claimsByID[id]
+		result := reservationResults[id]
+		capacityType := launchbackoff.ThrottledCapacityType(lo.Uniq(lo.Map(candidates[id], func(key cloudprovider.OfferingKey, _ int) string {
+			return key.CapacityType
+		})))
+		if !result.Admitted {
+			results.Omitted = append(results.Omitted, nodeClaim)
+			results.NextEligible = earliest(results.NextEligible, result.NextEligible)
+			launchbackoff.NodePoolsLaunchThrottledTotal.Inc(map[string]string{
+				metrics.NodePoolLabel:     nodeClaim.NodePoolName,
+				metrics.ReasonLabel:       launchbackoff.ThrottledReasonOfferingBudget,
+				metrics.CapacityTypeLabel: capacityType,
+			})
 			continue
 		}
-		// A risky NodeClaim on a constrained pool has to clear both gates, so a refusal cannot be
-		// attributed to one of them. Report the pool being constrained in that case, since that is
-		// the condition an operator would act on; a bare risky refusal means the pool has recovered
-		// and only the probe rate is holding this launch back.
-		launchbackoff.NodePoolsLaunchThrottledTotal.Inc(map[string]string{
-			metrics.NodePoolLabel: nodeClaims[i].NodePoolName,
-			metrics.ReasonLabel: lo.Ternary(p.launchBackoff.IsConstrained(ctx, nodeClaims[i].NodePoolUUID),
-				launchbackoff.ThrottledReasonConstrained, launchbackoff.ThrottledReasonRisky),
-			metrics.CapacityTypeLabel: launchbackoff.ThrottledCapacityType(nodeClaims[i].CapacityTypesAvailable()),
+		if result.DebitedOfferings > 0 {
+			launchbackoff.NodePoolsLaunchProbesTotal.Inc(map[string]string{
+				metrics.NodePoolLabel:     nodeClaim.NodePoolName,
+				metrics.CapacityTypeLabel: capacityType,
+			})
+			launchbackoff.NodePoolsLaunchProbeOfferings.Observe(float64(result.DebitedOfferings), map[string]string{
+				metrics.CapacityTypeLabel: capacityType,
+			})
+		}
+		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
+			v1.LaunchBackoffReservationAnnotationKey: id,
 		})
+		results.Admitted = append(results.Admitted, nodeClaim)
 	}
-	return admitted
+	return results, nil
+}
+
+func (p *Provisioner) ReleaseNodeClaimReservations(nodeClaims []*scheduler.NodeClaim) {
+	for _, nodeClaim := range nodeClaims {
+		if id := nodeClaim.Annotations[v1.LaunchBackoffReservationAnnotationKey]; id != "" {
+			p.launchBackoff.Release(id)
+		}
+	}
+}
+
+func (p *Provisioner) requeueForSchedulingResults(results scheduler.Results, reservations ReservationResults) reconciler.Result {
+	for _, node := range results.ExistingNodes {
+		if len(node.Pods) != 0 {
+			return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}
+		}
+	}
+	if len(results.PodErrors) == 0 && len(reservations.Omitted) == 0 {
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}
+	}
+	if len(results.OfferingsUnavailableErrors()) != len(results.PodErrors) {
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}
+	}
+	wake := reservations.NextEligible
+	if wake.IsZero() || wake.After(p.clock.Now().Add(launchbackoff.ProbeInterval)) {
+		wake = p.clock.Now().Add(launchbackoff.ProbeInterval)
+	}
+	return reconciler.Result{RequeueAfter: max(wake.Sub(p.clock.Now()), time.Second)}
+}
+
+func earliest(current, candidate time.Time) time.Time {
+	if candidate.IsZero() || (!current.IsZero() && !candidate.Before(current)) {
+		return current
+	}
+	return candidate
 }
 
 // CreateNodeClaims launches nodes passed into the function in parallel. It returns a slice of the successfully created node
@@ -526,9 +619,11 @@ func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts .
 	options := option.Resolve(opts...)
 	latest := &v1.NodePool{}
 	if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: n.NodePoolName}, latest); err != nil {
+		p.ReleaseNodeClaimReservations([]*scheduler.NodeClaim{n})
 		return "", fmt.Errorf("getting current resource usage, %w", err)
 	}
 	if err := latest.Spec.Limits.ExceededBy(p.cluster.NodePoolResourcesFor(n.NodePoolName)); err != nil {
+		p.ReleaseNodeClaimReservations([]*scheduler.NodeClaim{n})
 		return "", err
 	}
 	nodeClaim := n.ToNodeClaim()
@@ -536,6 +631,9 @@ func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts .
 	annotateNodeClaimWithNominatedPods(n, nodeClaim)
 
 	if err := p.kubeClient.Create(ctx, nodeClaim); err != nil {
+		if isDefinitiveCreateError(err) {
+			p.ReleaseNodeClaimReservations([]*scheduler.NodeClaim{n})
+		}
 		return "", err
 	}
 
@@ -576,6 +674,18 @@ func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts .
 		}
 	}
 	return nodeClaim.Name, nil
+}
+
+func isDefinitiveCreateError(err error) bool {
+	return apierrors.IsInvalid(err) ||
+		apierrors.IsBadRequest(err) ||
+		apierrors.IsNotFound(err) ||
+		apierrors.IsGone(err) ||
+		apierrors.IsForbidden(err) ||
+		apierrors.IsUnauthorized(err) ||
+		apierrors.IsMethodNotSupported(err) ||
+		apierrors.IsNotAcceptable(err) ||
+		apierrors.IsRequestEntityTooLargeError(err)
 }
 
 func instanceTypeList(names []string) string {

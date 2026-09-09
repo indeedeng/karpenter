@@ -363,16 +363,15 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	if q.HasAny(providerIDs...) {
 		return fmt.Errorf("candidate is being disrupted")
 	}
-	// Checked before anything is cordoned. Disruption is discretionary: replacing a healthy node from
-	// a NodePool that just failed to launch spends a probe that pending pods need more, and leaves a
-	// cordoned node behind if the replacement then fails too. All-or-nothing across replacement pools
-	// because a partially launched command still deletes every candidate.
-	//
-	// A peek, not an Admit: consuming the probe here is what would starve provisioning.
-	if constrained, ok := lo.Find(cmd.Replacements, func(r *Replacement) bool {
-		return q.launchBackoff.IsConstrained(ctx, r.NodePoolUUID)
-	}); ok {
-		return serrors.Wrap(fmt.Errorf("nodepool is recovering from insufficient capacity"), "NodePool", klog.KRef("", constrained.NodePoolName))
+	replacements := lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim })
+	if len(replacements) != 0 {
+		reservations, err := q.provisioner.ReserveReplacementNodeClaims(ctx, replacements)
+		if err != nil {
+			return fmt.Errorf("reserving replacement nodeclaims, %w", err)
+		}
+		if len(reservations.Omitted) != 0 {
+			return fmt.Errorf("replacement offerings are recovering from insufficient capacity")
+		}
 	}
 
 	log.FromContext(ctx).WithValues(append([]any{
@@ -384,6 +383,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// If we get a failure marking some nodes as disrupted, if we are launching replacements, we shouldn't continue
 	// with disrupting the candidates. If it's just a delete operation, we can proceed
 	if markDisruptedErr != nil && (len(cmd.Replacements) > 0 || len(markedCandidates) == 0) {
+		q.provisioner.ReleaseNodeClaimReservations(replacements)
 		return serrors.Wrap(fmt.Errorf("marking disrupted, %w", markDisruptedErr), "command-id", cmd.ID)
 	}
 

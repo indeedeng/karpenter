@@ -99,10 +99,9 @@ func NewControllers(
 ) []controller.Controller {
 	o := option.Resolve(opts...)
 	deviceAllocationController := deviceallocation.NewController(kubeClient)
-	// Shared by both provisioners and the disruption queue: an offering that ICEs for one of
-	// them is unavailable to all of them, and the per-NodePool budgets only bound anything if
-	// every path that can launch consumes from the same allowance.
-	launchBackoff := launchbackoff.NewTracker(clock)
+	// Shared by every launch path so NodePools contending for the same offering consume the
+	// same allowance and every lifecycle outcome settles the reservation that admitted it.
+	launchBackoff := launchbackoff.NewTracker(clock, 2*nodeclaimlifecycle.LaunchTimeout)
 	// Logged unconditionally so that a cluster reporting unexpected launch rates can be settled
 	// from its startup logs, without inferring the gate's state from the absence of behavior.
 	log.FromContext(ctx).WithValues(

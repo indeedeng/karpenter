@@ -223,7 +223,7 @@ var _ = Describe("Launch Backoff", func() {
 	It("should mark a backed-off offering unavailable in the NodePool instance type map", func() {
 		it := multiPoolInstanceType()
 		backedOff := availablePools(it)[0]
-		launchBackoff.Fail(ctx, backedOff)
+		launchBackoff.Fail(ctx, "", backedOff)
 
 		_, itMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider, launchBackoff)
 		Expect(err).To(Succeed())
@@ -234,7 +234,7 @@ var _ = Describe("Launch Backoff", func() {
 	It("should not disturb the offerings of a pool that has not failed", func() {
 		it := multiPoolInstanceType()
 		pools := availablePools(it)
-		launchBackoff.Fail(ctx, pools[0])
+		launchBackoff.Fail(ctx, "", pools[0])
 
 		_, itMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider, launchBackoff)
 		Expect(err).To(Succeed())
@@ -244,7 +244,7 @@ var _ = Describe("Launch Backoff", func() {
 	It("should leave the provider's cached instance types untouched", func() {
 		it := multiPoolInstanceType()
 		backedOff := availablePools(it)[0]
-		launchBackoff.Fail(ctx, backedOff)
+		launchBackoff.Fail(ctx, "", backedOff)
 
 		_, _, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider, launchBackoff)
 		Expect(err).To(Succeed())
@@ -253,11 +253,11 @@ var _ = Describe("Launch Backoff", func() {
 		// every other pool sharing the provider's cache.
 		Expect(availablePools(multiPoolInstanceType())).To(ContainElement(backedOff))
 	})
-	It("should restore the offering once its window elapses", func() {
+	It("should restore the offering once its budget refills", func() {
 		it := multiPoolInstanceType()
 		backedOff := availablePools(it)[0]
-		launchBackoff.Fail(ctx, backedOff)
-		env.Clock.Step(launchbackoff.BaseDelay + launchbackoff.MaxDelay)
+		launchBackoff.Fail(ctx, "", backedOff)
+		env.Clock.Step(launchbackoff.ProbeInterval)
 
 		_, itMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider, launchBackoff)
 		Expect(err).To(Succeed())

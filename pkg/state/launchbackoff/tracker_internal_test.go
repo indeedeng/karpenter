@@ -16,10 +16,6 @@ limitations under the License.
 
 package launchbackoff
 
-// Reclaiming a NodePool's budget entry has no effect a caller can observe — that is the point
-// of decay — so these specs read the maps directly rather than motivating an accessor that
-// only tests would use.
-
 import (
 	"context"
 	"time"
@@ -27,16 +23,21 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	clocktesting "k8s.io/utils/clock/testing"
 
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 )
 
-var _ = Describe("Pool entry decay", func() {
-	var ctx context.Context
-	var clk *clocktesting.FakeClock
-	var t *Tracker
-	uid := types.UID("nodepool-a")
+var _ = Describe("Tracker state invariants", func() {
+	var (
+		ctx context.Context
+		clk *clocktesting.FakeClock
+		t   *Tracker
+		k   cloudprovider.OfferingKey
+	)
 
 	BeforeEach(func() {
 		ctx = options.ToContext(context.Background(), &options.Options{
@@ -44,54 +45,191 @@ var _ = Describe("Pool entry decay", func() {
 		})
 		clk = clocktesting.NewFakeClock(time.Now())
 		t = NewTracker(clk)
-	})
-
-	It("should collect a released NodePool once it has gone quiet", func() {
-		t.FailPool(ctx, uid)
-		for range 4 {
-			t.SucceedPool(ctx, uid)
+		k = cloudprovider.OfferingKey{
+			InstanceType: "large",
+			CapacityType: v1.CapacityTypeSpot,
+			Zone:         "zone-a",
 		}
-		Expect(t.pools).To(HaveLen(1))
-
-		t.GC()
-		Expect(t.pools).To(HaveLen(1), "the aggregate window is still live")
-
-		clk.Step(ProbeInterval + MaxDelay)
-		t.GC()
-
-		Expect(t.pools).To(BeEmpty())
 	})
-	It("should retain a NodePool with a live risky window", func() {
-		Expect(t.Admit(ctx, uid, true)).To(BeTrue())
 
-		t.GC()
+	It("creates a closed burst-one entry on the first attributed failure", func() {
+		t.Fail(ctx, "failure", k)
 
-		Expect(t.pools).To(HaveLen(1))
+		entry := t.offerings[k]
+		Expect(entry.incarnation).To(Equal(uint64(1)))
+		Expect(entry.burst).To(Equal(1))
+		Expect(entry.remaining).To(BeZero())
+		Expect(entry.nextRefill).To(Equal(clk.Now().Add(ProbeInterval)))
+		Expect(entry.generation).To(BeZero())
+		Expect(entry.epoch).To(Equal(uint64(1)))
+		Expect(entry.lastFailure).ToNot(BeNil())
+		Expect(*entry.lastFailure).To(BeZero())
 	})
-	It("should collect a NodePool whose risky window has been quiet for MaxDelay", func() {
-		Expect(t.Admit(ctx, uid, true)).To(BeTrue())
-		clk.Step(ProbeInterval + MaxDelay)
 
-		t.GC()
+	It("does not move the window or epoch for duplicate failures in one generation", func() {
+		t.Fail(ctx, "failure-1", k)
+		entry := t.offerings[k]
+		nextRefill := entry.nextRefill
+		epoch := entry.epoch
 
-		Expect(t.pools).To(BeEmpty())
-	})
-	It("should not let ordinary admissions keep a recovered NodePool alive", func() {
-		Expect(t.Admit(ctx, uid, true)).To(BeTrue())
-		clk.Step(ProbeInterval + MaxDelay)
-
-		// A busy healthy NodePool admits constantly. If admission refreshed the risky window
-		// unconditionally, the entry would never age out.
-		for range 100 {
-			Expect(t.Admit(ctx, uid, false)).To(BeTrue())
+		for range 20 {
+			t.Fail(ctx, "duplicate", k)
 		}
-		t.GC()
 
-		Expect(t.pools).To(BeEmpty())
+		Expect(entry.nextRefill).To(Equal(nextRefill))
+		Expect(entry.epoch).To(Equal(epoch))
+		Expect(entry.burst).To(Equal(1))
+		Expect(entry.remaining).To(BeZero())
 	})
-	It("should not create an entry for an ordinary admission on a healthy NodePool", func() {
-		Expect(t.Admit(ctx, uid, false)).To(BeTrue())
 
-		Expect(t.pools).To(BeEmpty())
+	It("ignores success and refund outcomes stamped with an older generation", func() {
+		t.Fail(ctx, "initial-failure", k)
+		clk.Step(ProbeInterval)
+		Expect(t.Reserve(ctx, "ramp", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		t.Succeed(ctx, "ramp", k)
+		Expect(t.offerings[k].burst).To(Equal(2))
+
+		clk.Step(ProbeInterval)
+		Expect(t.Reserve(ctx, "stale-success", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		Expect(t.Reserve(ctx, "stale-release", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		oldGeneration := t.offerings[k].generation
+
+		clk.Step(ProbeInterval)
+		Expect(t.Reserve(ctx, "current", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		Expect(t.offerings[k].generation).To(Equal(oldGeneration + 1))
+		Expect(t.offerings[k].remaining).To(Equal(1))
+
+		t.Succeed(ctx, "stale-success", k)
+		t.Release("stale-release")
+
+		Expect(t.offerings[k].burst).To(Equal(2))
+		Expect(t.offerings[k].remaining).To(Equal(1))
+		Expect(t.reservations).ToNot(HaveKey("stale-success"))
+		Expect(t.reservations).ToNot(HaveKey("stale-release"))
+	})
+
+	It("makes a newer failure epoch dominate older success and refund outcomes", func() {
+		t.Fail(ctx, "initial-failure", k)
+		clk.Step(ProbeInterval)
+		Expect(t.Reserve(ctx, "ramp", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		t.Succeed(ctx, "ramp", k)
+
+		clk.Step(ProbeInterval)
+		Expect(t.Reserve(ctx, "stale-success", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		Expect(t.Reserve(ctx, "stale-release", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		oldEpoch := t.offerings[k].epoch
+
+		t.Fail(ctx, "new-failure", k)
+		Expect(t.offerings[k].epoch).To(Equal(oldEpoch + 1))
+
+		t.Succeed(ctx, "stale-success", k)
+		t.Release("stale-release")
+
+		Expect(t.offerings[k].burst).To(Equal(1))
+		Expect(t.offerings[k].remaining).To(BeZero())
+		Expect(t.offerings[k].nextRefill).To(Equal(clk.Now().Add(ProbeInterval)))
+	})
+
+	It("uses incarnation to prevent ABA refunds after entry deletion and recreation", func() {
+		t.nextIncarnation = 1
+		t.offerings[k] = &offeringEntry{
+			incarnation: 1,
+			burst:       1,
+			remaining:   1,
+			nextRefill:  clk.Now().Add(ProbeInterval),
+			generation:  0,
+			epoch:       1,
+			lastActive:  clk.Now(),
+		}
+		Expect(t.Reserve(ctx, "old", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		t.Bind("old", types.UID("old-nodeclaim"))
+		oldStamp := t.reservations["old"].keys[k]
+
+		clk.Step(EntryTTL)
+		t.Cleanup()
+		Expect(t.offerings).ToNot(HaveKey(k))
+		Expect(t.reservations).To(HaveKey("old"), "binding must keep the old settlement alive")
+
+		t.Fail(ctx, "new-failure", k)
+		newEntry := t.offerings[k]
+		Expect(newEntry.incarnation).ToNot(Equal(oldStamp.incarnation))
+		Expect(newEntry.generation).To(Equal(oldStamp.generation))
+		Expect(newEntry.epoch).To(Equal(oldStamp.epoch))
+
+		t.Release("old")
+
+		Expect(newEntry.remaining).To(BeZero(), "the stale debit must not refund the recreated entry")
+	})
+
+	It("expires and refunds unbound reservations at their TTL", func() {
+		const reservationTTL = time.Minute
+		t = NewTracker(clk, reservationTTL)
+		t.Fail(ctx, "failure", k)
+		clk.Step(ProbeInterval)
+		Expect(t.Reserve(ctx, "unbound", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		Expect(t.offerings[k].remaining).To(BeZero())
+
+		clk.Step(reservationTTL)
+		t.Cleanup()
+
+		Expect(t.reservations).ToNot(HaveKey("unbound"))
+		Expect(t.offerings[k].remaining).To(Equal(1))
+	})
+
+	It("keeps bound reservations beyond the unbound TTL until settlement", func() {
+		const reservationTTL = time.Minute
+		t = NewTracker(clk, reservationTTL)
+		t.Fail(ctx, "failure", k)
+		clk.Step(ProbeInterval)
+		Expect(t.Reserve(ctx, "bound", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		t.Bind("bound", types.UID("nodeclaim"))
+
+		clk.Step(reservationTTL)
+		t.Cleanup()
+
+		Expect(t.reservations).To(HaveKey("bound"))
+		Expect(t.reservations["bound"].expiresAt).To(BeZero())
+		Expect(t.reservations["bound"].nodeClaim).To(Equal(types.UID("nodeclaim")))
+		Expect(t.offerings[k].remaining).To(BeZero())
+
+		t.Release("bound")
+		Expect(t.reservations).ToNot(HaveKey("bound"))
+		Expect(t.offerings[k].remaining).To(Equal(1))
+	})
+
+	It("releases orphaned bound reservations without racing a newer binding", func() {
+		t.Fail(ctx, "failure", k)
+		clk.Step(ProbeInterval)
+		Expect(t.Reserve(ctx, "bound", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		t.Bind("bound", types.UID("old-nodeclaim"))
+		observed := t.BoundReservations()
+
+		t.Bind("bound", types.UID("new-nodeclaim"))
+		t.ReleaseOrphanedBoundReservations(observed, sets.New[types.UID]())
+		Expect(t.reservations).To(HaveKey("bound"))
+
+		t.ReleaseOrphanedBoundReservations(t.BoundReservations(), sets.New[types.UID]())
+		Expect(t.reservations).ToNot(HaveKey("bound"))
+		Expect(t.offerings[k].remaining).To(Equal(1))
+	})
+
+	It("discards budgets and reservations together across restart", func() {
+		t.Fail(ctx, "failure", k)
+		clk.Step(ProbeInterval)
+		Expect(t.Reserve(ctx, "bound", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+		t.Bind("bound", types.UID("nodeclaim"))
+
+		restarted := NewTracker(clk)
+		Expect(restarted.Empty()).To(BeTrue())
+		Expect(restarted.BoundReservations()).To(BeEmpty())
+		Expect(restarted.Reserve(ctx, "after-restart", []cloudprovider.OfferingKey{k}).Admitted).To(BeTrue())
+	})
+
+	It("does not allocate reservation bookkeeping on the empty-tracker fast path", func() {
+		result := t.Reserve(ctx, "healthy", []cloudprovider.OfferingKey{k})
+
+		Expect(result.Admitted).To(BeTrue())
+		Expect(result.DebitedOfferings).To(BeZero())
+		Expect(t.reservations).To(BeEmpty())
 	})
 })

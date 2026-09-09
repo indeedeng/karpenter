@@ -36,6 +36,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
@@ -617,18 +618,26 @@ var _ = Describe("Static Provisioning Controller", func() {
 	})
 
 	Context("Launch Backoff", func() {
-		var nodePool *v1.NodePool
+		var (
+			nodePool     *v1.NodePool
+			offeringKeys []cloudprovider.OfferingKey
+		)
 
 		BeforeEach(func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
 				FeatureGates: test.FeatureGates{LaunchBackoff: lo.ToPtr(true)},
 			}))
+			launchBackoff = launchbackoff.NewTracker(env.Clock)
+			instanceType := fake.NewInstanceType("launch-backoff-instance-type")
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{instanceType}
+			offeringKeys = lo.Map(instanceType.Offerings, func(offering *cloudprovider.Offering, _ int) cloudprovider.OfferingKey {
+				return offering.Key(instanceType.Name)
+			})
+			controller = static.NewController(env.Client, cluster, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Client), launchBackoff)
 			nodePool = test.StaticNodePool()
 			nodePool.Spec.Replicas = new(int64(5))
+			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("5")}
 			ExpectApplied(ctx, env.Client, nodePool)
-		})
-		AfterEach(func() {
-			launchBackoff.Delete(nodePool.UID)
 		})
 
 		It("should provision the full replica count when the nodepool has not failed", func() {
@@ -636,42 +645,23 @@ var _ = Describe("Static Provisioning Controller", func() {
 
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(5))
 		})
-		It("should withhold replicas beyond the probe allowance after an insufficient capacity failure", func() {
-			launchBackoff.FailPool(ctx, nodePool.UID)
-
-			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
-
-			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
-		})
-		It("should requeue for the next probe rather than the steady-state minute", func() {
-			// Nothing else wakes this controller while a replica count goes unmet, so the wait has to
-			// track the budget window and not the polling interval.
-			launchBackoff.FailPool(ctx, nodePool.UID)
+		It("should throttle each replica, requeue for refill, and release withheld node counts", func() {
+			launchBackoff.Fail(ctx, "", offeringKeys...)
+			env.Clock.Step(launchbackoff.ProbeInterval)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 
-			Expect(result.RequeueAfter).To(BeNumerically("<=", launchbackoff.ProbeInterval))
-			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
-		})
-		It("should release the node count it reserved for withheld replicas", func() {
-			// CreateNodeClaims only releases what it is handed. A leaked reservation would count
-			// against the NodePool's node limit until the process restarts.
-			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("5")}
-			ExpectApplied(ctx, env.Client, nodePool)
-			launchBackoff.FailPool(ctx, nodePool.UID)
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+			Expect(result.RequeueAfter).To(BeNumerically("~", launchbackoff.ProbeInterval, time.Second))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
 
-			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
-			ExpectDeleted(ctx, env.Client, ExpectNodeClaims(ctx, env.Client)[0])
-			cluster.Reset()
-
-			// A leak would leave fewer than 5 available on the retry.
-			launchBackoff.Delete(nodePool.UID)
-			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
-			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(5))
+			// The admitted replica is active and all four withheld reservations have been released.
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 5)).To(BeEquivalentTo(4))
+			cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 4)
 		})
 		It("should provision the full replica count while the gate is disabled", func() {
+			launchBackoff.Fail(ctx, "", offeringKeys...)
 			ctx = options.ToContext(ctx, test.Options())
-			launchBackoff.FailPool(ctx, nodePool.UID)
 
 			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 

@@ -106,15 +106,6 @@ func (i *NodeClaimTemplate) resolveCustomLabelsFromRequirements() map[string]str
 	return labels
 }
 
-// CapacityTypesAvailable reports the capacity types this NodeClaim could still launch into. A
-// single entry means the choice is already settled before the NodeClaim exists, which is what the
-// offering filter produces when it withdraws every offering of the other types. Callers that read
-// this before ToNodeClaim see the untruncated instance type set, so it can be broader than the
-// requirement ToNodeClaim ends up pinning, never narrower.
-func (i *NodeClaimTemplate) CapacityTypesAvailable() []string {
-	return capacityTypesOf(i.InstanceTypeOptions, i.Requirements)
-}
-
 func capacityTypesOf(its []*cloudprovider.InstanceType, reqs scheduling.Requirements) []string {
 	return lo.Uniq(lo.FlatMap(its, func(it *cloudprovider.InstanceType, _ int) []string {
 		return lo.Map(it.Offerings.Available().Compatible(reqs), func(o *cloudprovider.Offering, _ int) string {

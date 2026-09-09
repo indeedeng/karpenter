@@ -17,6 +17,8 @@ limitations under the License.
 package disruption_test
 
 import (
+	"context"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -27,6 +29,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 
@@ -49,6 +52,17 @@ var (
 	nodePool               *v1.NodePool
 	node1, node2           *corev1.Node
 )
+
+type failingNodePatchClient struct {
+	client.Client
+}
+
+func (f *failingNodePatchClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if _, ok := obj.(*corev1.Node); ok {
+		return fmt.Errorf("simulated error patching node")
+	}
+	return f.Client.Patch(ctx, obj, patch, opts...)
+}
 
 var _ = Describe("Queue", func() {
 	BeforeEach(func() {
@@ -515,17 +529,27 @@ var _ = Describe("Queue", func() {
 			)
 		})
 		Context("Launch Backoff", func() {
-			var stateNode *state.StateNode
-			var replacement *disruption.Replacement
+			var (
+				stateNode    *state.StateNode
+				offeringKeys []cloudprovider.OfferingKey
+			)
 
-			command := func() *disruption.Command {
+			command := func(q *disruption.Queue, replacementCount int) *disruption.Command {
+				replacements := make([]*disruption.Replacement, 0, replacementCount)
+				for range replacementCount {
+					nct := scheduling.NewNodeClaimTemplate(nodePool)
+					nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+					replacements = append(replacements, &disruption.Replacement{
+						NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct},
+					})
+				}
 				return &disruption.Command{
-					Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock, queue.NodePoolBackoff()),
+					Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock, q.NodePoolBackoff()),
 					CreationTimestamp: env.Clock.Now(),
 					ID:                uuid.New(),
 					Results:           scheduling.Results{},
 					Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
-					Replacements:      []*disruption.Replacement{replacement},
+					Replacements:      replacements,
 				}
 			}
 
@@ -533,59 +557,43 @@ var _ = Describe("Queue", func() {
 				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
 					FeatureGates: test.FeatureGates{LaunchBackoff: lo.ToPtr(true)},
 				}))
+				instanceType := cloudProvider.InstanceTypes[0]
+				cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{instanceType}
+				offeringKeys = lo.Map(instanceType.Offerings.Available(), func(offering *cloudprovider.Offering, _ int) cloudprovider.OfferingKey {
+					return offering.Key(instanceType.Name)
+				})
+				node1.Spec.Taints = lo.Reject(node1.Spec.Taints, func(taint corev1.Taint, _ int) bool {
+					return taint.MatchTaint(&v1.DisruptedNoScheduleTaint)
+				})
 				ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
 				stateNode = ExpectStateNodeExists(cluster, node1)
-
-				// The UID the API server assigned is the key the tracker budgets by.
-				nodePool = ExpectExists(ctx, env.Client, nodePool)
-				nct := scheduling.NewNodeClaimTemplate(nodePool)
-				nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
-				replacement = &disruption.Replacement{NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct}}
-			})
-			AfterEach(func() {
-				launchBackoff.Delete(nodePool.UID)
 			})
 
-			It("should start a command whose replacement nodepool has not failed", func() {
-				Expect(queue.StartCommand(ctx, command())).To(Succeed())
-			})
-			It("should refuse a command whose replacement nodepool is recovering", func() {
-				launchBackoff.FailPool(ctx, nodePool.UID)
+			It("should atomically reserve every replacement before cordoning candidates", func() {
+				launchBackoff.Fail(ctx, "", offeringKeys...)
+				env.Clock.Step(launchbackoff.ProbeInterval)
 
-				Expect(queue.StartCommand(ctx, command())).To(MatchError(ContainSubstring("recovering from insufficient capacity")))
-			})
-			It("should not mark the candidate disrupted when it refuses", func() {
-				// The refusal has to land before markDisrupted, or a command that never runs still
-				// leaves its candidates cordoned and condition-marked.
-				launchBackoff.FailPool(ctx, nodePool.UID)
+				Expect(queue.StartCommand(ctx, command(queue, 2))).To(MatchError(ContainSubstring("recovering from insufficient capacity")))
 
-				Expect(queue.StartCommand(ctx, command())).ToNot(Succeed())
-
+				node := ExpectExists(ctx, env.Client, node1)
+				Expect(node.Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
 				disrupted := ExpectExists(ctx, env.Client, nodeClaim1).StatusConditions().Get(v1.ConditionTypeDisruptionReason)
 				Expect(disrupted.IsTrue()).To(BeFalse())
+
+				// The first replacement's debit must be rolled back when the second cannot reserve.
+				Expect(launchBackoff.Reserve(ctx, "after-batch-rollback", offeringKeys).Admitted).To(BeTrue())
+				launchBackoff.Release("after-batch-rollback")
 			})
-			It("should not consume the probe that pending pods are waiting on", func() {
-				// A peek, not an admission. Spending the probe here is what starves provisioning.
-				launchBackoff.FailPool(ctx, nodePool.UID)
+			It("should release replacement reservations when cordoning fails", func() {
+				launchBackoff.Fail(ctx, "", offeringKeys...)
+				env.Clock.Step(launchbackoff.ProbeInterval)
+				failingQueue := disruption.NewQueue(&failingNodePatchClient{Client: env.Client}, recorder, cluster, env.Clock, prov, launchBackoff)
 
-				Expect(queue.StartCommand(ctx, command())).ToNot(Succeed())
+				Expect(failingQueue.StartCommand(ctx, command(failingQueue, 1))).To(MatchError(ContainSubstring("marking disrupted")))
 
-				Expect(launchBackoff.Admit(ctx, nodePool.UID, false)).To(BeTrue())
-			})
-			It("should start a pure deletion regardless of the nodepool being constrained", func() {
-				// Deleting frees capacity rather than asking for it, so there is nothing to throttle.
-				launchBackoff.FailPool(ctx, nodePool.UID)
-				cmd := command()
-				cmd.Replacements = nil
-
-				Expect(queue.StartCommand(ctx, cmd)).To(Succeed())
-			})
-			It("should start the command while the gate is disabled", func() {
-				launchBackoff.FailPool(ctx, nodePool.UID)
-				ctx = options.ToContext(ctx, test.Options())
-
-				Expect(queue.StartCommand(ctx, command())).To(Succeed())
+				Expect(launchBackoff.Reserve(ctx, "after-cordon-rollback", offeringKeys).Admitted).To(BeTrue())
+				launchBackoff.Release("after-cordon-rollback")
 			})
 		})
 	})

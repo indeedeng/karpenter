@@ -60,17 +60,20 @@ var _ = AfterSuite(func() {
 })
 
 var _ = AfterEach(func() {
+	env.Clock.Step(launchbackoff.EntryTTL)
+	launchBackoff.Cleanup()
+	ExpectSingletonReconciled(ctx, controller)
 	ExpectCleanedUp(ctx, env.Client)
 })
 
 var _ = Describe("Launch Backoff Metrics", func() {
-	var nodePool *v1.NodePool
-	var offering cloudprovider.OfferingKey
+	var (
+		offering  cloudprovider.OfferingKey
+		alternate cloudprovider.OfferingKey
+	)
 
-	// unavailableGauge reports whether a series exists for the offering, which is the assertion that
-	// matters: a recovered offering must stop being reported rather than report 0.
-	unavailableGauge := func(key cloudprovider.OfferingKey) (float64, bool) {
-		m, ok := FindMetricWithLabelValues(ExpectMetricName(launchbackoff.OfferingsUnavailable.(*opmetrics.PrometheusGauge)), map[string]string{
+	offeringGauge := func(gauge *opmetrics.PrometheusGauge, key cloudprovider.OfferingKey) (float64, bool) {
+		m, ok := FindMetricWithLabelValues(ExpectMetricName(gauge), map[string]string{
 			metrics.InstanceTypeLabel: key.InstanceType,
 			metrics.CapacityTypeLabel: key.CapacityType,
 			metrics.ZoneLabel:         key.Zone,
@@ -81,14 +84,10 @@ var _ = Describe("Launch Backoff Metrics", func() {
 		return lo.FromPtr(m.Gauge.Value), true
 	}
 
-	constrainedGauge := func(name string) (float64, bool) {
-		m, ok := FindMetricWithLabelValues(ExpectMetricName(launchbackoff.NodePoolsLaunchConstrained.(*opmetrics.PrometheusGauge)), map[string]string{
-			metrics.NodePoolLabel: name,
-		})
-		if !ok {
-			return 0, false
-		}
-		return lo.FromPtr(m.Gauge.Value), true
+	activeOfferings := func() float64 {
+		m, ok := FindMetricWithLabelValues(ExpectMetricName(launchbackoff.ActiveOfferings.(*opmetrics.PrometheusGauge)), map[string]string{})
+		Expect(ok).To(BeTrue())
+		return lo.FromPtr(m.Gauge.Value)
 	}
 
 	BeforeEach(func() {
@@ -97,114 +96,107 @@ var _ = Describe("Launch Backoff Metrics", func() {
 		}))
 		launchBackoff = launchbackoff.NewTracker(env.Clock)
 		controller = metricslaunchbackoff.NewController(env.Client, launchBackoff)
-		nodePool = test.NodePool()
-		ExpectApplied(ctx, env.Client, nodePool)
-		nodePool = ExpectExists(ctx, env.Client, nodePool)
-		// Prometheus collectors are process-global, while each spec gets a fresh Controller and
-		// metric Store. Use the unique NodePool name so a series left by one spec cannot satisfy
-		// another spec's lookup when Ginkgo changes execution order.
 		offering = cloudprovider.OfferingKey{
-			InstanceType: nodePool.Name,
+			InstanceType: "large",
 			CapacityType: v1.CapacityTypeSpot,
 			Zone:         "test-zone-1a",
 		}
+		alternate = cloudprovider.OfferingKey{
+			InstanceType: "small",
+			CapacityType: v1.CapacityTypeOnDemand,
+			Zone:         "test-zone-1b",
+		}
 	})
 
-	Context("offerings", func() {
-		It("should emit nothing for an offering that has never failed", func() {
-			ExpectSingletonReconciled(ctx, controller)
+	It("should report zero active offerings and no per-offering series without history", func() {
+		ExpectSingletonReconciled(ctx, controller)
 
-			_, found := unavailableGauge(offering)
-			Expect(found).To(BeFalse())
-		})
-		It("should report a backed-off offering as unavailable", func() {
-			launchBackoff.Fail(ctx, offering)
-
-			ExpectSingletonReconciled(ctx, controller)
-
-			value, found := unavailableGauge(offering)
-			Expect(found).To(BeTrue())
-			Expect(value).To(Equal(float64(1)))
-		})
-		It("should drop the series once the window elapses", func() {
-			// Not a 0: an offering leaving its window generates no event, so a series that lingered
-			// would need something to clear it and there is nothing to fire.
-			launchBackoff.Fail(ctx, offering)
-			ExpectSingletonReconciled(ctx, controller)
-			env.Clock.Step(launchbackoff.BaseDelay * 2)
-
-			ExpectSingletonReconciled(ctx, controller)
-
-			_, found := unavailableGauge(offering)
-			Expect(found).To(BeFalse())
-		})
-		It("should drop the series once a launch succeeds", func() {
-			launchBackoff.Fail(ctx, offering)
-			ExpectSingletonReconciled(ctx, controller)
-			launchBackoff.Succeed(ctx, offering)
-
-			ExpectSingletonReconciled(ctx, controller)
-
-			_, found := unavailableGauge(offering)
-			Expect(found).To(BeFalse())
-		})
+		_, budgetFound := offeringGauge(launchbackoff.OfferingsLaunchBudget.(*opmetrics.PrometheusGauge), offering)
+		_, unavailableFound := offeringGauge(launchbackoff.OfferingsUnavailable.(*opmetrics.PrometheusGauge), offering)
+		Expect(budgetFound).To(BeFalse())
+		Expect(unavailableFound).To(BeFalse())
+		Expect(activeOfferings()).To(BeZero())
 	})
+	It("should report launch budget, unavailability, and active offering count", func() {
+		launchBackoff.Fail(ctx, "failure", offering)
 
-	Context("nodepools", func() {
-		It("should emit nothing for a nodepool launching freely", func() {
-			ExpectSingletonReconciled(ctx, controller)
+		ExpectSingletonReconciled(ctx, controller)
 
-			_, found := constrainedGauge(nodePool.Name)
-			Expect(found).To(BeFalse())
-		})
-		It("should report a constrained nodepool by name", func() {
-			launchBackoff.FailPool(ctx, nodePool.UID)
-
-			ExpectSingletonReconciled(ctx, controller)
-
-			value, found := constrainedGauge(nodePool.Name)
-			Expect(found).To(BeTrue())
-			Expect(value).To(Equal(float64(1)))
-		})
-		It("should report the burst ceiling at the recovery floor", func() {
-			launchBackoff.FailPool(ctx, nodePool.UID)
-
-			ExpectSingletonReconciled(ctx, controller)
-
-			ExpectMetricGaugeValue(launchbackoff.NodePoolsLaunchBurst, 1, map[string]string{metrics.NodePoolLabel: nodePool.Name})
-		})
-		It("should raise the burst ceiling as launches succeed", func() {
-			// The ceiling, not the remaining allowance. Consumption would sawtooth and hide the ramp.
-			launchBackoff.FailPool(ctx, nodePool.UID)
-			launchBackoff.SucceedPool(ctx, nodePool.UID)
-
-			ExpectSingletonReconciled(ctx, controller)
-
-			ExpectMetricGaugeValue(launchbackoff.NodePoolsLaunchBurst, 2, map[string]string{metrics.NodePoolLabel: nodePool.Name})
-		})
-		It("should drop the series once the nodepool is released", func() {
-			launchBackoff.FailPool(ctx, nodePool.UID)
-			ExpectSingletonReconciled(ctx, controller)
-			for range 4 {
-				launchBackoff.SucceedPool(ctx, nodePool.UID)
-			}
-
-			ExpectSingletonReconciled(ctx, controller)
-
-			_, found := constrainedGauge(nodePool.Name)
-			Expect(found).To(BeFalse())
-		})
-		It("should skip a constrained nodepool whose object is gone", func() {
-			// The tracker keys by UID, which is meaningless on a dashboard. Nothing is emitted rather
-			// than a series labeled with a UID.
-			launchBackoff.FailPool(ctx, nodePool.UID)
-			ExpectDeleted(ctx, env.Client, nodePool)
-
-			ExpectSingletonReconciled(ctx, controller)
-
-			_, found := constrainedGauge(nodePool.Name)
-			Expect(found).To(BeFalse())
-		})
+		budget, budgetFound := offeringGauge(launchbackoff.OfferingsLaunchBudget.(*opmetrics.PrometheusGauge), offering)
+		unavailable, unavailableFound := offeringGauge(launchbackoff.OfferingsUnavailable.(*opmetrics.PrometheusGauge), offering)
+		Expect(budgetFound).To(BeTrue())
+		Expect(budget).To(Equal(float64(1)))
+		Expect(unavailableFound).To(BeTrue())
+		Expect(unavailable).To(Equal(float64(1)))
+		Expect(activeOfferings()).To(Equal(float64(1)))
 	})
+	It("should retain the budget but remove unavailability after the refill window", func() {
+		launchBackoff.Fail(ctx, "failure", offering)
+		ExpectSingletonReconciled(ctx, controller)
+		env.Clock.Step(launchbackoff.ProbeInterval)
 
+		ExpectSingletonReconciled(ctx, controller)
+
+		budget, budgetFound := offeringGauge(launchbackoff.OfferingsLaunchBudget.(*opmetrics.PrometheusGauge), offering)
+		_, unavailableFound := offeringGauge(launchbackoff.OfferingsUnavailable.(*opmetrics.PrometheusGauge), offering)
+		Expect(budgetFound).To(BeTrue())
+		Expect(budget).To(Equal(float64(1)))
+		Expect(unavailableFound).To(BeFalse())
+		Expect(activeOfferings()).To(Equal(float64(1)))
+	})
+	It("should report a successful reservation ramp and refund", func() {
+		launchBackoff.Fail(ctx, "failure-offering", offering)
+		launchBackoff.Fail(ctx, "failure-alternate", alternate)
+		env.Clock.Step(launchbackoff.ProbeInterval)
+		result := launchBackoff.Reserve(ctx, "reservation", []cloudprovider.OfferingKey{offering, alternate})
+		Expect(result.Admitted).To(BeTrue())
+		Expect(result.DebitedOfferings).To(Equal(2))
+		launchBackoff.Succeed(ctx, "reservation", offering)
+
+		ExpectSingletonReconciled(ctx, controller)
+
+		budget, budgetFound := offeringGauge(launchbackoff.OfferingsLaunchBudget.(*opmetrics.PrometheusGauge), offering)
+		_, unavailableFound := offeringGauge(launchbackoff.OfferingsUnavailable.(*opmetrics.PrometheusGauge), offering)
+		Expect(budgetFound).To(BeTrue())
+		Expect(budget).To(Equal(float64(2)))
+		Expect(unavailableFound).To(BeTrue())
+
+		alternateBudget, alternateBudgetFound := offeringGauge(launchbackoff.OfferingsLaunchBudget.(*opmetrics.PrometheusGauge), alternate)
+		_, alternateUnavailableFound := offeringGauge(launchbackoff.OfferingsUnavailable.(*opmetrics.PrometheusGauge), alternate)
+		Expect(alternateBudgetFound).To(BeTrue())
+		Expect(alternateBudget).To(Equal(float64(1)))
+		Expect(alternateUnavailableFound).To(BeFalse())
+		Expect(activeOfferings()).To(Equal(float64(2)))
+	})
+	It("should remove expired offering series and decrement the active count", func() {
+		launchBackoff.Fail(ctx, "failure", offering)
+		ExpectSingletonReconciled(ctx, controller)
+		env.Clock.Step(launchbackoff.EntryTTL)
+		launchBackoff.Cleanup()
+
+		ExpectSingletonReconciled(ctx, controller)
+
+		_, budgetFound := offeringGauge(launchbackoff.OfferingsLaunchBudget.(*opmetrics.PrometheusGauge), offering)
+		_, unavailableFound := offeringGauge(launchbackoff.OfferingsUnavailable.(*opmetrics.PrometheusGauge), offering)
+		Expect(budgetFound).To(BeFalse())
+		Expect(unavailableFound).To(BeFalse())
+		Expect(activeOfferings()).To(BeZero())
+	})
+	It("should release a bound reservation only after its NodeClaim no longer exists", func() {
+		launchBackoff.Fail(ctx, "failure", offering)
+		env.Clock.Step(launchbackoff.ProbeInterval)
+		Expect(launchBackoff.Reserve(ctx, "reservation", []cloudprovider.OfferingKey{offering}).Admitted).To(BeTrue())
+
+		nodeClaim := test.NodeClaim()
+		ExpectApplied(ctx, env.Client, nodeClaim)
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		launchBackoff.Bind("reservation", nodeClaim.UID)
+
+		ExpectSingletonReconciled(ctx, controller)
+		Expect(launchBackoff.Reserve(ctx, "competing", []cloudprovider.OfferingKey{offering}).Admitted).To(BeFalse())
+
+		ExpectDeleted(ctx, env.Client, nodeClaim)
+		ExpectSingletonReconciled(ctx, controller)
+		Expect(launchBackoff.Reserve(ctx, "competing", []cloudprovider.OfferingKey{offering}).Admitted).To(BeTrue())
+	})
 })

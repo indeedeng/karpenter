@@ -447,6 +447,10 @@ type OfferingsUnavailableError struct {
 	wrapped error
 }
 
+func NewOfferingsUnavailableError(err error) error {
+	return &OfferingsUnavailableError{wrapped: err}
+}
+
 // Error delegates rather than pre-rendering, because the wrapped InstanceTypeFilterError is
 // expensive to stringify and most of these are never printed.
 func (e *OfferingsUnavailableError) Error() string { return e.wrapped.Error() }
@@ -582,6 +586,8 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 		podRequests:  podRequests,
 	}
 	remaining := cloudprovider.InstanceTypes{}
+	remainingIgnoringAvailability := cloudprovider.InstanceTypes{}
+	remainingIgnoringAvailabilityNames := sets.New[string]()
 	// exposed host ports on the pod
 	hostPorts := scheduling.GetHostPorts(pod)
 	eligibleInstanceTypes := sets.New(instanceTypes...)
@@ -607,6 +613,15 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 			// about why scheduling failed
 			itCompat := compatible(it, requirements)
 			itFits, itHasOffering := fits(it, totalRequestsForInstanceType, requirements)
+			hypothetical := it.DeepCopy()
+			for _, offering := range hypothetical.Offerings {
+				offering.Available = true
+			}
+			hypotheticalFits, hypotheticalHasOffering := fits(hypothetical, totalRequestsForInstanceType, requirements)
+			if itCompat && hypotheticalFits && hypotheticalHasOffering && !remainingIgnoringAvailabilityNames.Has(it.Name) {
+				remainingIgnoringAvailability = append(remainingIgnoringAvailability, it)
+				remainingIgnoringAvailabilityNames.Insert(it.Name)
+			}
 
 			// track if any single instance type met a single criteria
 			err.requirementsMet = err.requirementsMet || itCompat
@@ -626,11 +641,6 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 		}
 	}
 
-	// Captured before the minValues check, which would run SatisfiesMinValues against an already
-	// empty set and report a violation that is really a symptom of having no usable offering left.
-	// Requiring requirementsMet excludes affinity and label failures; !hasOffering already implies
-	// !fits, since an instance type cannot fit without a compatible offering to fit into.
-	offeringBlocked := len(remaining) == 0 && err.requirementsMet && !err.hasOffering
 	if requirements.HasMinValues() {
 		// We don't care about the minimum number of instance types that meet our requirements here, we only care if they meet our requirements.
 		_, unsatisfiableKeys, err.minValuesIncompatibleErr = remaining.SatisfiesMinValues(requirements)
@@ -642,9 +652,14 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 				err.minValuesIncompatibleErr = nil
 			}
 		}
+		if !relaxMinValues {
+			if _, _, hypotheticalErr := remainingIgnoringAvailability.SatisfiesMinValues(requirements); hypotheticalErr != nil {
+				remainingIgnoringAvailability = nil
+			}
+		}
 	}
 	if len(remaining) == 0 {
-		if offeringBlocked {
+		if len(remainingIgnoringAvailability) > 0 {
 			return nil, unsatisfiableKeys, &OfferingsUnavailableError{wrapped: err}
 		}
 		return nil, unsatisfiableKeys, err

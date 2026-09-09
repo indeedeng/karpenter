@@ -21,12 +21,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/awslabs/operatorpkg/object"
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -104,6 +102,7 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 			return nil, nil
 		case cloudprovider.IsNodeClassNotReadyError(err):
 			log.FromContext(ctx).Error(err, "failed launching nodeclaim")
+			l.launchBackoff.Release(reservationID(nodeClaim))
 			if err = l.kubeClient.Delete(ctx, nodeClaim); err != nil {
 				return nil, client.IgnoreNotFound(err)
 			}
@@ -141,19 +140,15 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 
 // observeLaunchFailure feeds an insufficient capacity failure back to the launch backoff tracker.
 //
-// The keys the provider attributed back off exactly the pools that refused. The NodePool budget is
-// armed regardless, so a provider that attributes nothing still gets a bound on how fast Karpenter
-// retries — it just bounds the whole NodePool rather than the pools actually short.
+// The keys the provider attributed back off exactly the pools that refused. When attribution is
+// empty, the reservation's saved candidates provide the conservative fallback.
 func (l *Launch) observeLaunchFailure(ctx context.Context, nodeClaim *v1.NodeClaim, err error) {
 	var ice *cloudprovider.InsufficientCapacityError
 	var keys []cloudprovider.OfferingKey
 	if errors.As(err, &ice) {
-		keys = ice.Keys
+		keys = lo.Uniq(ice.Keys)
 	}
-	for _, key := range keys {
-		l.launchBackoff.Fail(ctx, key)
-	}
-	l.launchBackoff.FailPool(ctx, nodePoolUID(nodeClaim))
+	l.launchBackoff.Fail(ctx, reservationID(nodeClaim), keys...)
 
 	// Counted whether or not the gate is on. An operator deciding whether to enable backoff needs to
 	// see the failure rate it would be acting on first.
@@ -174,28 +169,18 @@ func (l *Launch) observeLaunchFailure(ctx context.Context, nodeClaim *v1.NodeCla
 	}
 }
 
-// observeLaunchSuccess clears backoff for the pool that just produced an instance. The labels come
-// from the created NodeClaim rather than the requested one, because the requested one carries the
-// set of offerings the launch was allowed to draw from, not the one it landed in.
+// observeLaunchSuccess ramps only the offering that produced an instance. The labels come from the
+// created NodeClaim because the requested one carries every offering it was allowed to draw from.
 func (l *Launch) observeLaunchSuccess(ctx context.Context, nodeClaim, created *v1.NodeClaim) {
-	l.launchBackoff.Succeed(ctx, cloudprovider.OfferingKey{
+	l.launchBackoff.Succeed(ctx, reservationID(nodeClaim), cloudprovider.OfferingKey{
 		InstanceType: created.Labels[corev1.LabelInstanceTypeStable],
 		CapacityType: created.Labels[v1.CapacityTypeLabelKey],
 		Zone:         created.Labels[corev1.LabelTopologyZone],
 	})
-	l.launchBackoff.SucceedPool(ctx, nodePoolUID(nodeClaim))
 }
 
-// nodePoolUID reads the owning NodePool's UID off the NodeClaim. Returns empty for a NodeClaim with
-// no NodePool owner, which the tracker treats as nothing to record.
-func nodePoolUID(nodeClaim *v1.NodeClaim) types.UID {
-	nodePoolKind := object.GVK(&v1.NodePool{}).Kind
-	for _, ref := range nodeClaim.OwnerReferences {
-		if ref.Kind == nodePoolKind {
-			return ref.UID
-		}
-	}
-	return ""
+func reservationID(nodeClaim *v1.NodeClaim) string {
+	return nodeClaim.Annotations[v1.LaunchBackoffReservationAnnotationKey]
 }
 
 func PopulateNodeClaimDetails(nodeClaim, retrieved *v1.NodeClaim) *v1.NodeClaim {
