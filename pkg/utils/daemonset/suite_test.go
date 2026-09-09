@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/karpenter/pkg/test"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
@@ -54,6 +55,16 @@ var _ = Describe("DaemonSetUtils", func() {
 		Expect(p1.Namespace).To(Equal(ds1.Namespace))
 		Expect(p2.Name).To(Equal(ds2.Name))
 		Expect(p2.Namespace).To(Equal(ds2.Namespace))
+	})
+	It("should copy the pod template labels from the DaemonSet", func() {
+		daemonSet := test.DaemonSet(test.DaemonSetOptions{
+			PodOptions: test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"k8s-app": "cilium"}}},
+		})
+		p := daemonset.PodForDaemonSet(daemonSet)
+		Expect(p.Labels).To(Equal(daemonSet.Spec.Template.Labels))
+		Expect(p.Labels).To(HaveKeyWithValue("k8s-app", "cilium"))
+		p.Labels["k8s-app"] = "mutated"
+		Expect(daemonSet.Spec.Template.Labels).To(HaveKeyWithValue("k8s-app", "cilium"))
 	})
 	It("should merge resource limits into requests if no requests exists for the given container", func() {
 		inputRequirements := corev1.ResourceRequirements{

@@ -75,9 +75,10 @@ func NewTopology(
 	pods []*corev1.Pod,
 	opts ...Options,
 ) (*Topology, error) {
+	resolvedOptions := option.Resolve(opts...)
 	t := &Topology{
 		kubeClient:            kubeClient,
-		preferencePolicy:      option.Resolve(opts...).preferencePolicy,
+		preferencePolicy:      resolvedOptions.preferencePolicy,
 		cluster:               cluster,
 		stateNodes:            stateNodes,
 		domainGroups:          buildDomainGroups(nodePools, instanceTypes),
@@ -86,15 +87,18 @@ func NewTopology(
 		excludedPods:          sets.New[string](),
 	}
 
+	allPods := make([]*corev1.Pod, 0, len(pods)+len(resolvedOptions.additionalExcludedPods))
+	allPods = append(allPods, pods...)
+	allPods = append(allPods, resolvedOptions.additionalExcludedPods...)
 	// these are the pods that we intend to schedule, so if they are currently in the cluster we shouldn't count them for
 	// topology purposes
-	for _, p := range pods {
+	for _, p := range allPods {
 		t.excludedPods.Insert(string(p.UID))
 	}
 
 	errs := t.updateInverseAffinities(ctx)
-	for i := range pods {
-		errs = multierr.Append(errs, t.Update(ctx, pods[i]))
+	for _, p := range allPods {
+		errs = multierr.Append(errs, t.Update(ctx, p))
 	}
 	if errs != nil {
 		return nil, errs
@@ -219,12 +223,16 @@ func (t *Topology) Record(p *corev1.Pod, taints []corev1.Taint, requirements sch
 	}
 }
 
-// AddRequirements tightens the input requirements by adding additional requirements that are being enforced by topology spreads
-// affinities, anti-affinities or inverse anti-affinities.  The nodeHostname is the hostname that we are currently considering
-// placing the pod on.  It returns these newly tightened requirements, or an error in the case of a set of requirements that
-// cannot be satisfied.
-func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
+// AddRequirements tightens nodeRequirements with the topology spread, pod affinity, pod anti-affinity, and inverse
+// anti-affinity constraints that apply to p. It returns the tightened requirements, or an error when no domain
+// satisfies a constraint.
+//
+// When expected is non-nil, its DaemonSet pods count in the new NodeClaim's hostname domain for p's own pod affinity
+// and anti-affinity terms. The returned instance type names are the ones those terms allow, or nil when the expected
+// pods do not change which instance types p can use.
+func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, expected *expectedDaemonPods, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, sets.Set[string], error) {
 	requirements := scheduling.NewRequirements(nodeRequirements.Values()...)
+	var allowedInstanceTypes sets.Set[string]
 	for _, topology := range t.getMatchingTopologies(p, taints, nodeRequirements, compatibilityOptions...) {
 		podDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
 		if podRequirements.Has(topology.Key) {
@@ -235,8 +243,17 @@ func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequ
 			nodeDomains = nodeRequirements.Get(topology.Key)
 		}
 		domains, _ := topology.Get(p, podDomains, nodeDomains)
+		if topology.IsOwnedBy(p.UID) {
+			var allowed sets.Set[string]
+			domains, allowed = expected.adjustDomains(topology, podDomains, nodeDomains, domains)
+			if allowed != nil && allowedInstanceTypes == nil {
+				allowedInstanceTypes = allowed
+			} else if allowed != nil {
+				allowedInstanceTypes = allowedInstanceTypes.Intersection(allowed)
+			}
+		}
 		if domains.Len() == 0 {
-			return nil, topologyError{
+			return nil, nil, topologyError{
 				topology:    topology,
 				podDomains:  podDomains,
 				nodeDomains: nodeDomains,
@@ -244,7 +261,7 @@ func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequ
 		}
 		requirements.Add(domains)
 	}
-	return requirements, nil
+	return requirements, allowedInstanceTypes, nil
 }
 
 // GetTopologyZoneConstraints returns the set of valid zones from all topology constraints
