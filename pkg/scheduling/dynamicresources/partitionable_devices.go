@@ -237,6 +237,26 @@ func (at *AllocationTracker) InitRemainingCounters(pool *Pool) {
 		deductFromCounters(remainingCounterSets, pool.NonTargetingDevices[i].Device)
 	}
 	at.RemainingCounters[pool.Key] = remainingCounterSets
+	at.deductInflightCountersForPool(pool.Key)
+}
+
+// deductInflightCountersForPool applies the pessimistic counter consumption from all in-flight
+// NodeClaims to a pool whose current-cluster baseline has already been initialized.
+func (at *AllocationTracker) deductInflightCountersForPool(poolKey PoolKey) {
+	remainingCounterSets, ok := at.RemainingCounters[poolKey]
+	if !ok {
+		return
+	}
+	remaining := map[PoolKey]map[string]map[string]resourcev1.Counter{
+		poolKey: remainingCounterSets,
+	}
+	for _, countersByIT := range at.countersByNodeClaimIT {
+		counterMax := pessimisticCounterMax(countersByIT)
+		if _, ok := counterMax[poolKey]; !ok {
+			continue
+		}
+		subtractDeltaFromRemaining(remaining, nil, counterMax)
+	}
 }
 
 // deductFromCounters subtracts a device's counter consumption from counter budgets.

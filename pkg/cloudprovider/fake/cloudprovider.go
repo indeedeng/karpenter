@@ -22,6 +22,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/awslabs/operatorpkg/serrors"
@@ -56,13 +57,14 @@ type CloudProvider struct {
 
 	mu sync.RWMutex
 	// CreateCalls contains the arguments for every create call that was made since it was cleared
-	CreateCalls        []*v1.NodeClaim
-	AllowedCreateCalls int
-	NextCreateErr      error
-	NextGetErr         error
-	NextDeleteErr      error
-	DeleteCalls        []*v1.NodeClaim
-	GetCalls           []string
+	CreateCalls           []*v1.NodeClaim
+	AllowedCreateCalls    int
+	NextCreateErr         error
+	NextGetErr            error
+	NextDeleteErr         error
+	DeleteCalls           []*v1.NodeClaim
+	GetCalls              []string
+	GetInstanceTypesCalls atomic.Int64
 
 	// CapacityUnavailable models capacity pools the cloud has no room in. Create tries compatible
 	// alternatives and returns an InsufficientCapacityError with every failed key only when none can
@@ -100,6 +102,7 @@ func (c *CloudProvider) Reset() {
 	c.NextGetErr = nil
 	c.DeleteCalls = []*v1.NodeClaim{}
 	c.GetCalls = nil
+	c.GetInstanceTypesCalls.Store(0)
 	c.Drifted = ""
 	c.NodeClassGroupVersionKind = []schema.GroupVersionKind{
 		{
@@ -241,6 +244,7 @@ func (c *CloudProvider) List(_ context.Context) ([]*v1.NodeClaim, error) {
 }
 
 func (c *CloudProvider) GetInstanceTypes(_ context.Context, np *v1.NodePool) ([]*cloudprovider.InstanceType, error) {
+	c.GetInstanceTypesCalls.Add(1)
 	if np != nil {
 		if err, ok := c.ErrorsForNodePool[np.Name]; ok {
 			return nil, err
