@@ -165,7 +165,7 @@ func NewOperator(o ...option.Function[Options]) (context.Context, *Operator) {
 	// Client
 	kubernetesInterface := kubernetes.NewForConfigOrDie(config)
 
-	log.FromContext(ctx).WithValues("version", Version).V(1).Info("discovered karpenter version")
+	log.FromContext(ctx).WithValues("version", Version, "featureGates", options.FromContext(ctx).FeatureGates).V(1).Info("discovered karpenter version")
 
 	// Manager
 	mgrOpts := ctrl.Options{
