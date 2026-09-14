@@ -345,6 +345,7 @@ var _ = Describe("Options", func() {
 			Entry("when StaticCapacity is overridden", "StaticCapacity"),
 			Entry("when CapacityBuffer is overridden", "CapacityBuffer"),
 			Entry("when NodePoolDriftBackoff is overridden", "NodePoolDriftBackoff"),
+			Entry("when LaunchBackoff is overridden", "LaunchBackoff"),
 		)
 	})
 
@@ -417,5 +418,6 @@ func expectOptionsMatch(optsA, optsB *options.Options) {
 	Expect(optsA.FeatureGates.CapacityBuffer).To(Equal(optsB.FeatureGates.CapacityBuffer))
 	Expect(optsA.FeatureGates.SpotToSpotConsolidation).To(Equal(optsB.FeatureGates.SpotToSpotConsolidation))
 	Expect(optsA.FeatureGates.NodePoolDriftBackoff).To(Equal(optsB.FeatureGates.NodePoolDriftBackoff))
+	Expect(optsA.FeatureGates.LaunchBackoff).To(Equal(optsB.FeatureGates.LaunchBackoff))
 	Expect(optsA.IgnoreDRARequests).To(Equal(optsB.IgnoreDRARequests))
 }

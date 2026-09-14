@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pdb"
@@ -196,7 +197,7 @@ func GetCandidates(ctx context.Context, cluster *state.Cluster, kubeClient clien
 func GetCandidatesWithTotals(ctx context.Context, cluster *state.Cluster, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
 	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue, clusterCost *cost.ClusterCost,
 ) ([]*Candidate, map[string]NodePoolTotals, error) {
-	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMap(ctx, kubeClient, cloudProvider)
+	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMap(ctx, kubeClient, cloudProvider, queue.launchBackoff)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -221,8 +222,10 @@ func stateNodesToSlice(nodes state.StateNodes) []*state.StateNode {
 	return []*state.StateNode(nodes)
 }
 
-// BuildNodePoolMap builds a provName -> nodePool map and a provName -> instanceName -> instance type map
-func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider) (map[string]*v1.NodePool, map[string]map[string]*cloudprovider.InstanceType, error) {
+// BuildNodePoolMap builds a provName -> nodePool map and a provName -> instanceName -> instance type map.
+// Offerings currently backed off after an insufficient capacity failure are marked unavailable, so a
+// replacement is never simulated against capacity that just refused to launch.
+func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, launchBackoff *launchbackoff.Tracker) (map[string]*v1.NodePool, map[string]map[string]*cloudprovider.InstanceType, error) {
 	nodePoolMap := map[string]*v1.NodePool{}
 	nodePools, err := nodepoolutils.ListManaged(ctx, kubeClient, cloudProvider)
 	if err != nil {
@@ -248,7 +251,7 @@ func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvid
 			continue
 		}
 		nodePoolToInstanceTypesMap[np.Name] = map[string]*cloudprovider.InstanceType{}
-		for _, it := range nodePoolInstanceTypes {
+		for _, it := range launchbackoff.FilterUnavailable(ctx, nodePoolInstanceTypes, launchBackoff) {
 			nodePoolToInstanceTypesMap[np.Name][it.Name] = it
 		}
 	}

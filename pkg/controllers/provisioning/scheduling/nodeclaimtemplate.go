@@ -106,6 +106,14 @@ func (i *NodeClaimTemplate) resolveCustomLabelsFromRequirements() map[string]str
 	return labels
 }
 
+func capacityTypesOf(its []*cloudprovider.InstanceType, reqs scheduling.Requirements) []string {
+	return lo.Uniq(lo.FlatMap(its, func(it *cloudprovider.InstanceType, _ int) []string {
+		return lo.Map(it.Offerings.Available().Compatible(reqs), func(o *cloudprovider.Offering, _ int) string {
+			return o.CapacityType()
+		})
+	}))
+}
+
 func (i *NodeClaimTemplate) ToNodeClaim() *v1.NodeClaim {
 	// Inject instanceType requirements for NodeClaims belonging to dynamic NodePool
 	// For static we let cloudprovider.Create()
@@ -117,11 +125,7 @@ func (i *NodeClaimTemplate) ToNodeClaim() *v1.NodeClaim {
 		})...))
 
 		// Collect available capacity types from the selected instance types
-		capacityTypes := lo.Uniq(lo.FlatMap(instanceTypes, func(it *cloudprovider.InstanceType, _ int) []string {
-			return lo.Map(it.Offerings.Available().Compatible(i.Requirements), func(o *cloudprovider.Offering, _ int) string {
-				return o.CapacityType()
-			})
-		}))
+		capacityTypes := capacityTypesOf(instanceTypes, i.Requirements)
 		if len(capacityTypes) > 0 {
 			i.Requirements.Add(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, capacityTypes...))
 		}

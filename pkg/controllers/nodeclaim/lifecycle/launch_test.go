@@ -18,14 +18,19 @@ package lifecycle_test
 
 import (
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	nodeclaimlifecycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
+	launchbackoffstate "sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -114,5 +119,140 @@ var _ = Describe("Launch", func() {
 		Expect(condition.Status).To(Equal(metav1.ConditionUnknown))
 		Expect(condition.Reason).To(Equal(conditionReason))
 		Expect(condition.Message).To(Equal(conditionMessage))
+	})
+
+	Context("Launch Backoff", func() {
+		const reservationTTL = time.Second
+
+		var (
+			nodeClaim     *v1.NodeClaim
+			reservationID string
+			offering      cloudprovider.OfferingKey
+			alternate     cloudprovider.OfferingKey
+		)
+
+		BeforeEach(func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+				FeatureGates: test.FeatureGates{LaunchBackoff: lo.ToPtr(true)},
+			}))
+			launchBackoff = launchbackoffstate.NewTracker(env.Clock, reservationTTL)
+			nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Client, cloudProvider, recorder, npState, nil, launchBackoff)
+			reservationID = "reservation"
+			offering = cloudprovider.OfferingKey{
+				InstanceType: "large",
+				CapacityType: v1.CapacityTypeSpot,
+				Zone:         "test-zone-1a",
+			}
+			alternate = cloudprovider.OfferingKey{
+				InstanceType: "small",
+				CapacityType: v1.CapacityTypeOnDemand,
+				Zone:         "test-zone-1b",
+			}
+			nodeClaim = test.NodeClaim(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      map[string]string{v1.NodePoolLabelKey: nodePool.Name},
+					Annotations: map[string]string{v1.LaunchBackoffReservationAnnotationKey: reservationID},
+				},
+			})
+		})
+		AfterEach(func() {
+			launchBackoff = launchbackoffstate.NewTracker(env.Clock)
+			nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Client, cloudProvider, recorder, npState, nil, launchBackoff)
+			ctx = options.ToContext(ctx, test.Options())
+		})
+
+		reserve := func(keys ...cloudprovider.OfferingKey) {
+			GinkgoHelper()
+			for i, key := range keys {
+				launchBackoff.Fail(ctx, fmt.Sprintf("seed-%d", i), key)
+			}
+			env.Clock.Step(launchbackoffstate.ProbeInterval)
+			result := launchBackoff.Reserve(ctx, reservationID, keys)
+			Expect(result.Admitted).To(BeTrue())
+			Expect(result.DebitedOfferings).To(Equal(len(keys)))
+		}
+
+		It("should bind a reservation to the NodeClaim before launching", func() {
+			reserve(offering)
+			cloudProvider.NextCreateErr = cloudprovider.NewCreateError(fmt.Errorf("transient error"), "LaunchFailed", "transient error")
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim)
+			env.Clock.Step(2 * reservationTTL)
+			launchBackoff.Cleanup()
+
+			Expect(launchBackoff.Reserve(ctx, "competing", []cloudprovider.OfferingKey{offering}).Admitted).To(BeFalse())
+			launchBackoff.Release(reservationID)
+			Expect(launchBackoff.Reserve(ctx, "after-release", []cloudprovider.OfferingKey{offering}).Admitted).To(BeTrue())
+		})
+		It("should release a reservation when the NodeClaim is deleted before launch", func() {
+			reserve(offering)
+			nodeClaim.Finalizers = []string{v1.TerminationFinalizer}
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			Expect(env.Client.Delete(ctx, nodeClaim)).To(Succeed())
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+
+			Expect(launchBackoff.Reserve(ctx, "after-deletion", []cloudprovider.OfferingKey{offering}).Admitted).To(BeTrue())
+		})
+		It("should settle an attributed insufficient capacity failure against only the refused offering", func() {
+			reserve(offering, alternate)
+			cloudProvider.NextCreateErr = cloudprovider.NewInsufficientCapacityError(fmt.Errorf("no capacity"), offering)
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+
+			Expect(launchBackoff.Budgets()).To(Equal(map[cloudprovider.OfferingKey]launchbackoffstate.OfferingBudget{
+				offering:  {Burst: 1, Unavailable: true},
+				alternate: {Burst: 1, Unavailable: false},
+			}))
+		})
+		It("should settle an unattributed insufficient capacity failure against every reserved offering", func() {
+			reserve(offering, alternate)
+			cloudProvider.NextCreateErr = cloudprovider.NewInsufficientCapacityError(fmt.Errorf("no capacity"))
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
+
+			Expect(launchBackoff.Budgets()).To(Equal(map[cloudprovider.OfferingKey]launchbackoffstate.OfferingBudget{
+				offering:  {Burst: 1, Unavailable: true},
+				alternate: {Burst: 1, Unavailable: true},
+			}))
+		})
+		It("should ramp the landed offering and refund the other reserved offerings on success", func() {
+			probe, err := cloudProvider.Create(ctx, nodeClaim.DeepCopy())
+			Expect(err).To(Succeed())
+			landed := cloudprovider.OfferingKey{
+				InstanceType: probe.Labels[corev1.LabelInstanceTypeStable],
+				CapacityType: probe.Labels[v1.CapacityTypeLabelKey],
+				Zone:         probe.Labels[corev1.LabelTopologyZone],
+			}
+			cloudProvider.Reset()
+			reserve(landed, alternate)
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+
+			Expect(launchBackoff.Budgets()).To(Equal(map[cloudprovider.OfferingKey]launchbackoffstate.OfferingBudget{
+				landed:    {Burst: 2, Unavailable: true},
+				alternate: {Burst: 1, Unavailable: false},
+			}))
+			refunded := launchBackoff.Reserve(ctx, "refunded", []cloudprovider.OfferingKey{alternate})
+			Expect(refunded.Admitted).To(BeTrue())
+			Expect(refunded.DebitedOfferings).To(Equal(1))
+		})
+		It("should record nothing while the gate is disabled", func() {
+			ctx = options.ToContext(ctx, test.Options())
+			Expect(launchBackoff.Reserve(ctx, reservationID, []cloudprovider.OfferingKey{offering}).Admitted).To(BeTrue())
+			cloudProvider.NextCreateErr = cloudprovider.NewInsufficientCapacityError(fmt.Errorf("no capacity"), offering)
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+
+			Expect(launchBackoff.Budgets()).To(BeEmpty())
+		})
 	})
 })

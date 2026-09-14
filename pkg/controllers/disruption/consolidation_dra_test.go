@@ -63,7 +63,7 @@ var _ = Describe("Consolidation/DRA", func() {
 		ExpectDeviceAllocationReconciled(ctx, env.Client, draController)
 		pdbs, err := pdb.NewLimits(ctx, env.Client)
 		Expect(err).To(Succeed())
-		nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider)
+		nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider, launchBackoff)
 		Expect(err).To(Succeed())
 		candidates := lo.Map(nodes, func(node *corev1.Node, _ int) *disruption.Candidate {
 			stateNode := ExpectStateNodeExists(cluster, node)

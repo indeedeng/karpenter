@@ -164,11 +164,16 @@ func NewScheduler(
 	}
 	// Pre-filter instance types eligible for NodePools to reduce work done during scheduling loops for pods
 	// if no templates remain, we still want to build the scheduler so that Karpenter can ack pods which can schedule to existing and in-flight capacity
+	var unavailableTemplates []*NodeClaimTemplate
 	templates := lo.FilterMap(nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
 		var err error
 		nct := NewNodeClaimTemplate(np)
 		nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(instanceTypes[np.Name], nct.Requirements, &corev1.Pod{}, corev1.ResourceList{}, []DaemonOverheadGroup{{InstanceTypes: instanceTypes[np.Name], HostPortUsage: scheduling.NewHostPortUsage()}}, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
 		if len(nct.InstanceTypeOptions) == 0 {
+			if IsOfferingsUnavailableError(err) {
+				nct.InstanceTypeOptions = instanceTypes[np.Name]
+				unavailableTemplates = append(unavailableTemplates, nct)
+			}
 			if instanceTypeFilterErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeFilterErr.minValuesIncompatibleErr != nil {
 				recorder.Publish(NoCompatibleInstanceTypes(np, true))
 				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types", "minValuesIncompatibleErr", instanceTypeFilterErr.minValuesIncompatibleErr)
@@ -186,7 +191,7 @@ func NewScheduler(
 		nodeClaimTemplates:   templates,
 		topology:             topology,
 		cluster:              cluster,
-		daemonOverheadGroups: buildDaemonOverheadGroups(ctx, templates, daemonSetPods),
+		daemonOverheadGroups: buildDaemonOverheadGroups(ctx, append(append([]*NodeClaimTemplate{}, templates...), unavailableTemplates...), daemonSetPods),
 		cachedPodData:        map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
 		volumeReqsByPod:      volumeReqsByPod,          // Volume requirements per pod
 		recorder:             recorder,
@@ -200,6 +205,7 @@ func NewScheduler(
 		preferencePolicy:        option.Resolve(opts...).preferencePolicy,
 		minValuesPolicy:         minValuesPolicy,
 		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
+		unavailableTemplates:    unavailableTemplates,
 		allocator:               allocator,
 		instanceTypes:           instanceTypes,
 		cachedResourceClaims:    map[types.NamespacedName]*resourcev1.ResourceClaim{},
@@ -244,6 +250,7 @@ type Scheduler struct {
 	newNodeClaims           []*NodeClaim
 	existingNodes           []*ExistingNode
 	nodeClaimTemplates      []*NodeClaimTemplate
+	unavailableTemplates    []*NodeClaimTemplate
 	remainingResources      map[string]corev1.ResourceList // (NodePool name) -> remaining resources for that NodePool
 	daemonOverheadGroups    map[*NodeClaimTemplate][]DaemonOverheadGroup
 	cachedPodData           map[types.UID]*PodData                  // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
@@ -359,6 +366,12 @@ func isVirtualBufferPod(p *corev1.Pod) bool {
 func (r Results) ReservedOfferingErrors() map[*corev1.Pod]error {
 	return lo.PickBy(r.PodErrors, func(_ *corev1.Pod, err error) bool {
 		return IsReservedOfferingError(err)
+	})
+}
+
+func (r Results) OfferingsUnavailableErrors() map[*corev1.Pod]error {
+	return lo.PickBy(r.PodErrors, func(_ *corev1.Pod, err error) bool {
+		return IsOfferingsUnavailableError(err)
 	})
 }
 
@@ -613,11 +626,17 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 		return nil
 	}
 	if len(s.nodeClaimTemplates) == 0 {
+		if err := s.offeringsUnavailableError(ctx, pod); err != nil {
+			return err
+		}
 		return fmt.Errorf("nodepool requirements filtered out all available instance types")
 	}
 	err := s.addToNewNodeClaim(ctx, pod)
 	if err == nil {
 		return nil
+	}
+	if unavailableErr := s.offeringsUnavailableError(ctx, pod); unavailableErr != nil {
+		err = multierr.Append(err, unavailableErr)
 	}
 	return err
 }
@@ -700,6 +719,17 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 		return nil
 	}
 	return fmt.Errorf("failed scheduling pod to inflight nodes")
+}
+
+func (s *Scheduler) offeringsUnavailableError(ctx context.Context, pod *corev1.Pod) error {
+	for _, template := range s.unavailableTemplates {
+		nodeClaim := NewNodeClaim(template, s.topology, s.daemonOverheadGroups[template], template.InstanceTypeOptions, s.reservationManager, s.reservedOfferingMode)
+		_, _, _, _, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort, s.allocator)
+		if IsOfferingsUnavailableError(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 //nolint:gocyclo
