@@ -333,6 +333,16 @@ func (i *InstanceType) Allocatable() corev1.ResourceList {
 	return i.allocatableOfferings[0].Allocatable
 }
 
+// AllocatableForOffering returns the allocatable resources the given offering would produce,
+// regardless of whether the offering is available. Offerings without overrides share the
+// memoized base allocatable; override allocatables are computed on each call.
+func (i *InstanceType) AllocatableForOffering(o *Offering) corev1.ResourceList {
+	if len(o.CapacityOverride) == 0 && o.OverheadOverride == nil {
+		return i.Allocatable()
+	}
+	return i.computeAllocatable(o.CapacityOverride, o.OverheadOverride)
+}
+
 func (its InstanceTypes) OrderByPrice(reqs scheduling.Requirements) InstanceTypes {
 	// Order instance types so that we get the cheapest instance types of the available offerings
 	sort.Slice(its, func(i, j int) bool {
@@ -462,6 +472,16 @@ func (i InstanceTypeOverhead) Total() corev1.ResourceList {
 	return resources.Merge(i.KubeReserved, i.SystemReserved, i.EvictionThreshold)
 }
 
+// OfferingKey identifies a cloud capacity pool: the tuple that a provider's
+// insufficient-capacity signal is scoped to. It is a value type so that it can be used as a
+// map key and carried inside errors without aliasing an *Offering, whose Available field is
+// mutated by scheduling filters.
+type OfferingKey struct {
+	InstanceType string
+	CapacityType string
+	Zone         string
+}
+
 // An Offering describes where an InstanceType is available to be used, with the expectation that its properties
 // may be tightly coupled (e.g. the availability of an instance type in some zone is scoped to a capacity type) and
 // these properties are captured with labels in Requirements.
@@ -538,6 +558,12 @@ func (o *Offering) Zone() string {
 
 func (o *Offering) ReservationID() string {
 	return o.Requirements.Get(ReservationIDLabel).Any()
+}
+
+// Key returns the OfferingKey for this offering. The instance type name is a parameter
+// because an Offering does not carry it.
+func (o *Offering) Key(instanceType string) OfferingKey {
+	return OfferingKey{InstanceType: instanceType, CapacityType: o.CapacityType(), Zone: o.Zone()}
 }
 
 // +k8s:deepcopy-gen=true
@@ -634,11 +660,16 @@ func IgnoreNodeClaimNotFoundError(err error) error {
 // InsufficientCapacityError is an error type returned by CloudProviders when a launch fails due to a lack of capacity from NodeClaim requirements
 type InsufficientCapacityError struct {
 	error
+	// Keys are the offerings the provider actually attempted, when it is able to attribute the
+	// failure. Empty means the failure could not be attributed to specific offerings, which is
+	// the case for any provider that has not been updated to populate it.
+	Keys []OfferingKey
 }
 
-func NewInsufficientCapacityError(err error) *InsufficientCapacityError {
+func NewInsufficientCapacityError(err error, keys ...OfferingKey) *InsufficientCapacityError {
 	return &InsufficientCapacityError{
 		error: err,
+		Keys:  keys,
 	}
 }
 

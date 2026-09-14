@@ -434,6 +434,37 @@ func InstanceTypeList(instanceTypeOptions []*cloudprovider.InstanceType) string 
 	return itSb.String()
 }
 
+// OfferingsUnavailableError marks a scheduling failure whose only cause was that no compatible
+// offering was usable — every instance type that otherwise matched the pod had its offerings
+// either backed off after an insufficient capacity failure or reported unavailable by the
+// provider. It is distinct from the ordinary unschedulable case because it is expected to clear
+// on its own once a backoff window elapses, which is what lets the provisioner requeue instead of
+// waiting for an unrelated cluster change.
+//
+// Failures on requirements, resources, or minValues are deliberately not wrapped: those need a
+// change to the pod or the cluster, so requeueing would spin.
+type OfferingsUnavailableError struct {
+	wrapped error
+}
+
+func NewOfferingsUnavailableError(err error) error {
+	return &OfferingsUnavailableError{wrapped: err}
+}
+
+// Error delegates rather than pre-rendering, because the wrapped InstanceTypeFilterError is
+// expensive to stringify and most of these are never printed.
+func (e *OfferingsUnavailableError) Error() string { return e.wrapped.Error() }
+
+func (e *OfferingsUnavailableError) Unwrap() error { return e.wrapped }
+
+func IsOfferingsUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var target *OfferingsUnavailableError
+	return errors.As(err, &target)
+}
+
 type InstanceTypeFilterError struct {
 	// Each of these three flags indicates if that particular criteria was met by at least one instance type
 	requirementsMet bool
@@ -555,6 +586,7 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 		podRequests:  podRequests,
 	}
 	remaining := cloudprovider.InstanceTypes{}
+	var compatibleCandidates []availabilityCandidate
 	// exposed host ports on the pod
 	hostPorts := scheduling.GetHostPorts(pod)
 	eligibleInstanceTypes := sets.New(instanceTypes...)
@@ -580,6 +612,13 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 			// about why scheduling failed
 			itCompat := compatible(it, requirements)
 			itFits, itHasOffering := fits(it, totalRequestsForInstanceType, requirements)
+			if itCompat {
+				compatibleCandidates = append(compatibleCandidates, availabilityCandidate{
+					instanceType: it,
+					requests:     totalRequestsForInstanceType,
+					launchable:   itFits && itHasOffering,
+				})
+			}
 
 			// track if any single instance type met a single criteria
 			err.requirementsMet = err.requirementsMet || itCompat
@@ -612,9 +651,55 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 		}
 	}
 	if len(remaining) == 0 {
+		if onlyOfferingsUnavailable(compatibleCandidates, requirements, relaxMinValues) {
+			return nil, unsatisfiableKeys, &OfferingsUnavailableError{wrapped: err}
+		}
 		return nil, unsatisfiableKeys, err
 	}
 	return remaining, unsatisfiableKeys, nil
+}
+
+// availabilityCandidate is a requirements-compatible instance type paired with the requests it was
+// checked against, which differ per daemon overhead group.
+type availabilityCandidate struct {
+	instanceType *cloudprovider.InstanceType
+	requests     corev1.ResourceList
+	launchable   bool
+}
+
+// onlyOfferingsUnavailable reports whether the filter would have succeeded had every offering been
+// available. It runs only after filtering fails because it is too expensive for the scheduling hot path.
+func onlyOfferingsUnavailable(candidates []availabilityCandidate, requirements scheduling.Requirements, relaxMinValues bool) bool {
+	checkMinValues := requirements.HasMinValues() && !relaxMinValues
+	var fitting cloudprovider.InstanceTypes
+	names := sets.New[string]()
+	for _, c := range candidates {
+		if names.Has(c.instanceType.Name) {
+			continue
+		}
+		if !c.launchable && !fitsIgnoringAvailability(c.instanceType, c.requests, requirements) {
+			continue
+		}
+		if !checkMinValues {
+			return true
+		}
+		fitting = append(fitting, c.instanceType)
+		names.Insert(c.instanceType.Name)
+	}
+	if len(fitting) == 0 {
+		return false
+	}
+	_, _, minValuesErr := fitting.SatisfiesMinValues(requirements)
+	return minValuesErr == nil
+}
+
+func fitsIgnoringAvailability(instanceType *cloudprovider.InstanceType, requests corev1.ResourceList, requirements scheduling.Requirements) bool {
+	for _, of := range instanceType.Offerings {
+		if requirements.IsCompatible(of.Requirements, scheduling.AllowUndefinedWellKnownLabels) && resources.Fits(requests, instanceType.AllocatableForOffering(of)) {
+			return true
+		}
+	}
+	return false
 }
 
 func compatible(instanceType *cloudprovider.InstanceType, requirements scheduling.Requirements) bool {

@@ -150,4 +150,7 @@ settings:
     # -- nodePoolDriftBackoff is enabled by default.
     # Setting this to false disables per-NodePool exponential back-off on unrecoverable drift replacement failures.
     nodePoolDriftBackoff: true
+    # -- launchBackoff is ALPHA and is disabled by default.
+    # Setting this to true will bound retries independently for capacity pools that returned insufficient capacity.
+    launchBackoff: false
 

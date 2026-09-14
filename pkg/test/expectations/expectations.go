@@ -367,7 +367,12 @@ func ExpectProvisionedNoBinding(ctx context.Context, c client.Client, cluster *s
 		log.Printf("error provisioning in test, %s", err)
 		return result
 	}
-	for _, m := range results.NewNodeClaims {
+	reservations, err := provisioner.ReserveNodeClaims(ctx, results.NewNodeClaims)
+	if err != nil {
+		log.Printf("error reserving launch offerings in test, %s", err)
+		return result
+	}
+	for _, m := range reservations.Admitted {
 		// TODO: Check the error on the provisioner launch
 		nodeClaimName, err := provisioner.Create(ctx, m, provisioning.WithReason(metrics.ProvisionedReason))
 		if err != nil {
