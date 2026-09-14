@@ -50,6 +50,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
@@ -67,6 +68,7 @@ var (
 	prov                *provisioning.Provisioner
 	env                 *test.Environment
 	instanceTypeMap     map[string]*cloudprovider.InstanceType
+	launchBackoff       *launchbackoff.Tracker
 )
 
 func TestAPIs(t *testing.T) {
@@ -81,7 +83,8 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
 	nodeController = informer.NewNodeController(env.Client, cluster)
-	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client))
+	launchBackoff = launchbackoff.NewTracker(env.Clock)
+	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), launchBackoff)
 	daemonsetController = informer.NewDaemonSetController(env.Client, cluster)
 	instanceTypes, _ := cloudProvider.GetInstanceTypes(ctx, nil)
 	instanceTypeMap = map[string]*cloudprovider.InstanceType{}
@@ -3456,3 +3459,226 @@ func AddInstanceResources(instanceTypes []*cloudprovider.InstanceType, resources
 	))
 	return instanceTypes
 }
+
+var _ = Describe("Launch Backoff", func() {
+	const instanceTypeName = "test-instance-type"
+	var pod *corev1.Pod
+
+	// The fake instance type offers exactly one capacity pool in test-zone-3. Pinning the pod there
+	// means backing that pool off leaves it nowhere to go, so these specs assert that the filter
+	// removed the offering rather than that the scheduler happened to prefer somewhere else.
+	onlyPoolInZone3 := cloudprovider.OfferingKey{
+		InstanceType: instanceTypeName,
+		CapacityType: v1.CapacityTypeOnDemand,
+		Zone:         "test-zone-3",
+	}
+
+	BeforeEach(func() {
+		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+			FeatureGates: test.FeatureGates{LaunchBackoff: lo.ToPtr(true)},
+		}))
+		launchBackoff = launchbackoff.NewTracker(env.Clock)
+		prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), launchBackoff)
+		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{fake.NewInstanceType(instanceTypeName)}
+		pod = test.UnschedulablePod(test.PodOptions{
+			NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-3"},
+		})
+		ExpectApplied(ctx, env.Client, test.NodePool())
+	})
+
+	It("should provision normally when no offering has failed", func() {
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+
+		ExpectScheduled(ctx, env.Client, pod)
+	})
+	It("should not provision into a backed-off offering", func() {
+		launchBackoff.Fail(ctx, "", onlyPoolInZone3)
+
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+
+		ExpectNotScheduled(ctx, env.Client, pod)
+	})
+	It("should provision again once the backoff window elapses", func() {
+		launchBackoff.Fail(ctx, "", onlyPoolInZone3)
+		env.Clock.Step(launchbackoff.ProbeInterval)
+
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+
+		ExpectScheduled(ctx, env.Client, pod)
+		nodeClaims := &v1.NodeClaimList{}
+		Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
+		Expect(nodeClaims.Items).To(HaveLen(1))
+		Expect(nodeClaims.Items[0].Annotations).To(HaveKey(v1.LaunchBackoffReservationAnnotationKey))
+	})
+	It("should share one launch allowance across NodePools selecting the same offering", func() {
+		sharedOffering := cloudprovider.OfferingKey{
+			InstanceType: "shared-instance-type",
+			CapacityType: v1.CapacityTypeOnDemand,
+			Zone:         "shared-zone",
+		}
+		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+			fake.NewInstanceType(sharedOffering.InstanceType,
+				fake.WithOfferings(cloudprovider.Offering{
+					Available: true,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{
+						v1.CapacityTypeLabelKey:  sharedOffering.CapacityType,
+						corev1.LabelTopologyZone: sharedOffering.Zone,
+					}),
+					Price: 1.0,
+				}),
+			),
+		}
+		nodePools := []*v1.NodePool{test.NodePool(), test.NodePool()}
+		ExpectApplied(ctx, env.Client, nodePools[0], nodePools[1])
+		pods := lo.Map(nodePools, func(nodePool *v1.NodePool, _ int) *corev1.Pod {
+			return test.UnschedulablePod(test.PodOptions{
+				NodeSelector: map[string]string{v1.NodePoolLabelKey: nodePool.Name},
+			})
+		})
+
+		launchBackoff.Fail(ctx, "", sharedOffering)
+		env.Clock.Step(launchbackoff.ProbeInterval)
+		results := ExpectProvisionedResults(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+		Expect(results.PodErrors).To(BeEmpty())
+		Expect(results.NewNodeClaims).To(HaveLen(2))
+
+		reservations, err := prov.ReserveNodeClaims(ctx, results.NewNodeClaims)
+		Expect(err).ToNot(HaveOccurred())
+		defer prov.ReleaseNodeClaimReservations(reservations.Admitted)
+		Expect(reservations.Admitted).To(HaveLen(1))
+		Expect(reservations.Omitted).To(HaveLen(1))
+		Expect(reservations.NextEligible).To(Equal(env.Clock.Now().Add(launchbackoff.ProbeInterval)))
+		Expect(launchBackoff.Budgets()[sharedOffering]).To(Equal(launchbackoff.OfferingBudget{
+			Burst:       1,
+			Unavailable: true,
+		}))
+		ExpectMetricCounterValue(launchbackoff.NodePoolsLaunchProbesTotal, 1, map[string]string{
+			metrics.NodePoolLabel:     reservations.Admitted[0].NodePoolName,
+			metrics.CapacityTypeLabel: sharedOffering.CapacityType,
+		})
+		ExpectMetricCounterValue(launchbackoff.NodePoolsLaunchThrottledTotal, 1, map[string]string{
+			metrics.NodePoolLabel:     reservations.Omitted[0].NodePoolName,
+			metrics.CapacityTypeLabel: sharedOffering.CapacityType,
+			metrics.ReasonLabel:       launchbackoff.ThrottledReasonOfferingBudget,
+		})
+		claims := append(append([]*pscheduling.NodeClaim{}, reservations.Admitted...), reservations.Omitted...)
+		Expect(lo.Map(claims, func(nodeClaim *pscheduling.NodeClaim, _ int) string {
+			return nodeClaim.NodePoolName
+		})).To(ConsistOf(nodePools[0].Name, nodePools[1].Name))
+	})
+	It("should preserve healthy alternatives on a flexible NodeClaim", func() {
+		pod = test.UnschedulablePod(test.PodOptions{
+			NodeSelector: map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand},
+		})
+		cloudProvider.CapacityUnavailable.Insert(onlyPoolInZone3)
+		launchBackoff.Fail(ctx, "", onlyPoolInZone3)
+
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+
+		ExpectScheduled(ctx, env.Client, pod)
+		pod = ExpectExists(ctx, env.Client, pod)
+		node := ExpectNodeExists(ctx, env.Client, pod.Spec.NodeName)
+		Expect(node.Labels[corev1.LabelTopologyZone]).ToNot(Equal(onlyPoolInZone3.Zone))
+	})
+	It("should relax soft topology spread onto an available offering", func() {
+		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{fake.NewInstanceType(instanceTypeName,
+			fake.WithOfferings(
+				cloudprovider.Offering{
+					Available: true,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{
+						v1.CapacityTypeLabelKey:  v1.CapacityTypeOnDemand,
+						corev1.LabelTopologyZone: "test-zone-1",
+					}),
+					Price: 1.0,
+				},
+				cloudprovider.Offering{
+					Available: true,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{
+						v1.CapacityTypeLabelKey:  v1.CapacityTypeOnDemand,
+						corev1.LabelTopologyZone: "test-zone-2",
+					}),
+					Price: 1.0,
+				},
+			),
+		)}
+		launchBackoff.Fail(ctx, "", cloudprovider.OfferingKey{
+			InstanceType: instanceTypeName,
+			CapacityType: v1.CapacityTypeOnDemand,
+			Zone:         "test-zone-2",
+		})
+		labels := map[string]string{"app": "soft-spread"}
+		pods := test.UnschedulablePods(test.PodOptions{
+			ObjectMeta: metav1.ObjectMeta{Labels: labels},
+			TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+				MaxSkew:           1,
+				TopologyKey:       corev1.LabelTopologyZone,
+				WhenUnsatisfiable: corev1.ScheduleAnyway,
+				LabelSelector:     &metav1.LabelSelector{MatchLabels: labels},
+			}},
+		}, 2)
+
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+
+		for _, spreadPod := range pods {
+			node := ExpectScheduled(ctx, env.Client, spreadPod)
+			Expect(node.Labels[corev1.LabelTopologyZone]).To(Equal("test-zone-1"))
+		}
+	})
+	It("should keep hard topology spread pending until the unavailable offering refills", func() {
+		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{fake.NewInstanceType(instanceTypeName,
+			fake.WithOfferings(
+				cloudprovider.Offering{
+					Available: true,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{
+						v1.CapacityTypeLabelKey:  v1.CapacityTypeOnDemand,
+						corev1.LabelTopologyZone: "test-zone-1",
+					}),
+					Price: 1.0,
+				},
+				cloudprovider.Offering{
+					Available: true,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{
+						v1.CapacityTypeLabelKey:  v1.CapacityTypeOnDemand,
+						corev1.LabelTopologyZone: "test-zone-2",
+					}),
+					Price: 1.0,
+				},
+			),
+		)}
+		zone2 := cloudprovider.OfferingKey{
+			InstanceType: instanceTypeName,
+			CapacityType: v1.CapacityTypeOnDemand,
+			Zone:         "test-zone-2",
+		}
+		launchBackoff.Fail(ctx, "", zone2)
+		labels := map[string]string{"app": "hard-spread"}
+		pods := test.UnschedulablePods(test.PodOptions{
+			ObjectMeta: metav1.ObjectMeta{Labels: labels},
+			TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+				MaxSkew:           1,
+				MinDomains:        lo.ToPtr(int32(2)),
+				TopologyKey:       corev1.LabelTopologyZone,
+				WhenUnsatisfiable: corev1.DoNotSchedule,
+				LabelSelector:     &metav1.LabelSelector{MatchLabels: labels},
+			}},
+		}, 2)
+
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+		pending := lo.Filter(pods, func(spreadPod *corev1.Pod, _ int) bool {
+			return ExpectExists(ctx, env.Client, spreadPod).Spec.NodeName == ""
+		})
+		Expect(pending).To(HaveLen(1))
+
+		env.Clock.Step(launchbackoff.ProbeInterval)
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pending...)
+		ExpectScheduled(ctx, env.Client, pending[0])
+	})
+	It("should ignore the backoff while the feature gate is off", func() {
+		ctx = options.ToContext(ctx, test.Options())
+		launchBackoff.Fail(ctx, "", onlyPoolInZone3)
+
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+
+		ExpectScheduled(ctx, env.Client, pod)
+	})
+})

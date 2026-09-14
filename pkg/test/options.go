@@ -60,6 +60,7 @@ type FeatureGates struct {
 	StaticCapacity          *bool
 	CapacityBuffer          *bool
 	NodePoolDriftBackoff    *bool
+	LaunchBackoff           *bool
 }
 
 func Options(overrides ...OptionsFields) *options.Options {
@@ -98,6 +99,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 			StaticCapacity:          lo.FromPtrOr(opts.FeatureGates.StaticCapacity, false),
 			CapacityBuffer:          lo.FromPtrOr(opts.FeatureGates.CapacityBuffer, false),
 			NodePoolDriftBackoff:    lo.FromPtrOr(opts.FeatureGates.NodePoolDriftBackoff, true),
+			LaunchBackoff:           lo.FromPtrOr(opts.FeatureGates.LaunchBackoff, false),
 		},
 	}
 }

@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 )
 
 type Launch struct {
@@ -42,6 +43,7 @@ type Launch struct {
 	cache         *cache.Cache // exists due to eventual consistency on the cache
 	recorder      events.Recorder
 	clock         clock.Clock
+	launchBackoff *launchbackoff.Tracker
 }
 
 func (l *Launch) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
@@ -85,6 +87,9 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 		case cloudprovider.IsInsufficientCapacityError(err):
 			l.recorder.Publish(InsufficientCapacityErrorEvents(ctx, l.kubeClient, nodeClaim, err)...)
 			log.FromContext(ctx).Error(err, "failed launching nodeclaim")
+			// Recorded before the delete below, which returns early on error and would otherwise drop
+			// the only evidence that this pool is short.
+			l.observeLaunchFailure(ctx, nodeClaim, err)
 
 			if err = l.kubeClient.Delete(ctx, nodeClaim); err != nil {
 				return nil, client.IgnoreNotFound(err)
@@ -97,6 +102,7 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 			return nil, nil
 		case cloudprovider.IsNodeClassNotReadyError(err):
 			log.FromContext(ctx).Error(err, "failed launching nodeclaim")
+			l.launchBackoff.Release(reservationID(nodeClaim))
 			if err = l.kubeClient.Delete(ctx, nodeClaim); err != nil {
 				return nil, client.IgnoreNotFound(err)
 			}
@@ -121,6 +127,8 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 		delete(nodeClaim.Annotations, "karpenter.indeed.com/nominated-pods")
 	}
 
+	l.observeLaunchSuccess(ctx, nodeClaim, created)
+
 	log.FromContext(ctx).WithValues(
 		"provider-id", created.Status.ProviderID,
 		"instance-type", created.Labels[corev1.LabelInstanceTypeStable],
@@ -128,6 +136,51 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 		"capacity-type", created.Labels[v1.CapacityTypeLabelKey],
 		"allocatable", created.Status.Allocatable).Info("launched nodeclaim")
 	return created, nil
+}
+
+// observeLaunchFailure feeds an insufficient capacity failure back to the launch backoff tracker.
+//
+// The keys the provider attributed back off exactly the pools that refused. When attribution is
+// empty, the reservation's saved candidates provide the conservative fallback.
+func (l *Launch) observeLaunchFailure(ctx context.Context, nodeClaim *v1.NodeClaim, err error) {
+	var ice *cloudprovider.InsufficientCapacityError
+	var keys []cloudprovider.OfferingKey
+	if errors.As(err, &ice) {
+		keys = lo.Uniq(ice.Keys)
+	}
+	l.launchBackoff.Fail(ctx, reservationID(nodeClaim), keys...)
+
+	// Counted whether or not the gate is on. An operator deciding whether to enable backoff needs to
+	// see the failure rate it would be acting on first.
+	if len(keys) == 0 {
+		launchbackoff.OfferingsLaunchFailuresTotal.Inc(map[string]string{
+			metrics.InstanceTypeLabel: "",
+			metrics.CapacityTypeLabel: "",
+			metrics.ZoneLabel:         "",
+		})
+		return
+	}
+	for _, key := range keys {
+		launchbackoff.OfferingsLaunchFailuresTotal.Inc(map[string]string{
+			metrics.InstanceTypeLabel: key.InstanceType,
+			metrics.CapacityTypeLabel: key.CapacityType,
+			metrics.ZoneLabel:         key.Zone,
+		})
+	}
+}
+
+// observeLaunchSuccess ramps only the offering that produced an instance. The labels come from the
+// created NodeClaim because the requested one carries every offering it was allowed to draw from.
+func (l *Launch) observeLaunchSuccess(ctx context.Context, nodeClaim, created *v1.NodeClaim) {
+	l.launchBackoff.Succeed(ctx, reservationID(nodeClaim), cloudprovider.OfferingKey{
+		InstanceType: created.Labels[corev1.LabelInstanceTypeStable],
+		CapacityType: created.Labels[v1.CapacityTypeLabelKey],
+		Zone:         created.Labels[corev1.LabelTopologyZone],
+	})
+}
+
+func reservationID(nodeClaim *v1.NodeClaim) string {
+	return nodeClaim.Annotations[v1.LaunchBackoffReservationAnnotationKey]
 }
 
 func PopulateNodeClaimDetails(nodeClaim, retrieved *v1.NodeClaim) *v1.NodeClaim {

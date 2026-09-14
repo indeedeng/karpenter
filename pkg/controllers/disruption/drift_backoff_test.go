@@ -139,7 +139,10 @@ var _ = Describe("Drift back-off", func() {
 			queue.NodePoolBackoff().Fail(backedOff.Name)
 			Expect(queue.NodePoolBackoff().IsBackedOff(backedOff.Name)).To(BeTrue())
 
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodePoolDriftBackoff: lo.ToPtr(false)}}))
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{
+				NodePoolDriftBackoff:     lo.ToPtr(false),
+				DriftReplacementBatching: lo.ToPtr(false),
+			}}))
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			cmds := queue.GetCommands()
