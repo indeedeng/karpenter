@@ -62,6 +62,7 @@ const (
 	RebootTerminationGracePeriodAnnotationKey  = apis.Group + "/reboot-termination-grace-period"
 	DRADriversAnnotationKey                    = apis.Group + "/requested-dra-drivers"
 	DisruptionCostAnnotationKey                = apis.Group + "/disruption-cost"
+	LaunchBackoffReservationAnnotationKey      = apis.Group + "/launch-backoff-reservation"
 )
 
 var (
@@ -172,6 +173,15 @@ var (
 			"controller.kubernetes.io/pod-deletion-cost itself.",
 		Stage: docs.Alpha,
 	}
+	LaunchBackoffReservationAnnotation = wellknown.Annotation{
+		Name:    LaunchBackoffReservationAnnotationKey,
+		Example: "6f1c2a9e-0b7d-4c3e-8a5f-2d9e1b4c7a30",
+		UsedOn:  []runtime.Object{&NodeClaim{}},
+		Help: "Karpenter sets this to the launch-backoff reservation ID admitted for the NodeClaim when the " +
+			"LaunchBackoff feature gate is enabled. The reservation is released when the NodeClaim is deleted.",
+		Stage:        docs.Alpha,
+		InternalOnly: true,
+	}
 )
 
 // KarpenterAnnotations are the well known annotations Karpenter reads or writes.
@@ -186,6 +196,7 @@ var KarpenterAnnotations = []wellknown.Annotation{
 	RebootTerminationGracePeriodAnnotation,
 	DRADriversAnnotation,
 	DisruptionCostAnnotation,
+	LaunchBackoffReservationAnnotation,
 }
 
 // Karpenter specific finalizers

@@ -106,6 +106,18 @@ func (i *NodeClaimTemplate) resolveCustomLabelsFromRequirements() map[string]str
 	return labels
 }
 
+// capacityTypesOf collects launchable capacity types from the instance types. Use Launchable (not Available) so a
+// full-but-healthy reservation (Available, ReservationCapacity=0) doesn't contribute `reserved` to the
+// capacity-type requirement — otherwise we could build a NodeClaim that includes `reserved` and then can't
+// launch into it.
+func capacityTypesOf(its []*cloudprovider.InstanceType, reqs scheduling.Requirements) []string {
+	return lo.Uniq(lo.FlatMap(its, func(it *cloudprovider.InstanceType, _ int) []string {
+		return lo.Map(it.Offerings.Launchable().Compatible(reqs), func(o *cloudprovider.Offering, _ int) string {
+			return o.CapacityType()
+		})
+	}))
+}
+
 func (i *NodeClaimTemplate) ToNodeClaim() *v1.NodeClaim {
 	// Inject instanceType requirements for NodeClaims belonging to dynamic NodePool
 	// For static we let cloudprovider.Create()
@@ -116,15 +128,8 @@ func (i *NodeClaimTemplate) ToNodeClaim() *v1.NodeClaim {
 			return i.Name
 		})...))
 
-		// Collect launchable capacity types from the selected instance types. Use Launchable (not Available) so a
-		// full-but-healthy reservation (Available, ReservationCapacity=0) doesn't contribute `reserved` to the
-		// capacity-type requirement — otherwise we could build a NodeClaim that includes `reserved` and then can't
-		// launch into it.
-		capacityTypes := lo.Uniq(lo.FlatMap(instanceTypes, func(it *cloudprovider.InstanceType, _ int) []string {
-			return lo.Map(it.Offerings.Launchable().Compatible(i.Requirements), func(o *cloudprovider.Offering, _ int) string {
-				return o.CapacityType()
-			})
-		}))
+		// Collect launchable capacity types from the selected instance types
+		capacityTypes := capacityTypesOf(instanceTypes, i.Requirements)
 		if len(capacityTypes) > 0 {
 			i.Requirements.Add(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, capacityTypes...))
 		}

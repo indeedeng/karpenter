@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/karpenter/pkg/operator/logging"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
@@ -61,6 +62,7 @@ var (
 	cluster             *state.Cluster
 	recorder            *test.EventRecorder
 	npState             *nodepoolhealth.State
+	launchBackoff       *launchbackoff.Tracker
 )
 
 func TestAPIs(t *testing.T) {
@@ -89,7 +91,8 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
 	npState = nodepoolhealth.NewState()
-	nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Client, cloudProvider, recorder, cluster, npState, nil)
+	launchBackoff = launchbackoff.NewTracker(env.Clock)
+	nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Client, cloudProvider, recorder, cluster, npState, nil, launchBackoff)
 })
 
 var _ = AfterSuite(func() {

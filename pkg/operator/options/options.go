@@ -71,6 +71,7 @@ type FeatureGates struct {
 	TerminateFirstRepair      bool
 	PodDeletionCostManagement bool
 	NodePoolDriftBackoff      bool
+	LaunchBackoff             bool
 }
 
 // FeatureGate is the source-of-truth description of a feature gate. Declaring gates as FeatureGates keeps each gate's
@@ -156,6 +157,14 @@ var (
 		Help: "Karpenter backs off drift disruption for a NodePool whose replacement NodeClaims fail to launch due " +
 			"to insufficient capacity, increasing the backoff exponentially up to 10 minutes.",
 	}
+	LaunchBackoffFeatureGate = FeatureGate{
+		Name:    "LaunchBackoff",
+		Default: false,
+		Stage:   docs.Alpha,
+		Help: "Karpenter backs off launches per instance type, capacity type, and zone offering after repeated " +
+			"insufficient capacity errors, retrying failed offerings at a bounded rate while healthy offerings " +
+			"continue to provision.",
+	}
 )
 
 // KarpenterFeatureGates are the feature gates Karpenter supports, in the order --feature-gates lists them.
@@ -170,6 +179,7 @@ var KarpenterFeatureGates = []FeatureGate{
 	TerminateFirstRepairFeatureGate,
 	PodDeletionCostManagementFeatureGate,
 	NodePoolDriftBackoffFeatureGate,
+	LaunchBackoffFeatureGate,
 }
 
 // Options contains all CLI flags / env vars for karpenter-core. It adheres to the options.Injectable interface.
@@ -297,6 +307,7 @@ func DefaultFeatureGates() FeatureGates {
 		TerminateFirstRepair:      TerminateFirstRepairFeatureGate.Default,
 		PodDeletionCostManagement: PodDeletionCostManagementFeatureGate.Default,
 		NodePoolDriftBackoff:      NodePoolDriftBackoffFeatureGate.Default,
+		LaunchBackoff:             LaunchBackoffFeatureGate.Default,
 	}
 }
 
@@ -338,6 +349,9 @@ func ParseFeatureGates(gateStr string) (FeatureGates, error) {
 	}
 	if val, ok := gateMap[NodePoolDriftBackoffFeatureGate.Name]; ok {
 		gates.NodePoolDriftBackoff = val
+	}
+	if val, ok := gateMap[LaunchBackoffFeatureGate.Name]; ok {
+		gates.LaunchBackoff = val
 	}
 
 	return gates, nil

@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -66,6 +67,11 @@ type CloudProvider struct {
 	RebootOperationIDs []string
 	GetCalls           []string
 
+	// CapacityUnavailable models capacity pools the cloud has no room in. Create tries compatible
+	// alternatives and returns an InsufficientCapacityError with every failed key only when none can
+	// fulfill the request. Unlike NextCreateErr this persists across calls.
+	CapacityUnavailable sets.Set[cloudprovider.OfferingKey]
+
 	CreatedNodeClaims         map[string]*v1.NodeClaim
 	Drifted                   cloudprovider.DriftReason
 	NodeClassGroupVersionKind []schema.GroupVersionKind
@@ -91,6 +97,7 @@ func (c *CloudProvider) Reset() {
 	c.InstanceTypesForNodePool = map[string][]*cloudprovider.InstanceType{}
 	c.ErrorsForNodePool = map[string]error{}
 	c.AllowedCreateCalls = math.MaxInt
+	c.CapacityUnavailable = sets.New[cloudprovider.OfferingKey]()
 	c.NextCreateErr = nil
 	c.NextDeleteErr = nil
 	c.NextRebootErr = nil
@@ -167,7 +174,38 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *v1.NodeClaim) (*v
 		jOfferings := instanceTypes[j].Offerings.Available().Compatible(reqs)
 		return iOfferings.Cheapest().Price < jOfferings.Cheapest().Price
 	})
-	instanceType := instanceTypes[0]
+	var instanceType *cloudprovider.InstanceType
+	var offering *cloudprovider.Offering
+	var failed []cloudprovider.OfferingKey
+	for _, candidateInstanceType := range instanceTypes {
+		offerings := candidateInstanceType.Offerings.Available().Compatible(reqs)
+		// Prioritize reserved offerings that still have capacity
+		launchableReserved := func(o *cloudprovider.Offering) bool {
+			return o.CapacityType() == v1.CapacityTypeReserved && o.ReservationCapacity > 0
+		}
+		sort.SliceStable(offerings, func(i, j int) bool {
+			return launchableReserved(offerings[i]) && !launchableReserved(offerings[j])
+		})
+		for _, candidateOffering := range offerings {
+			key := candidateOffering.Key(candidateInstanceType.Name)
+			if c.CapacityUnavailable.Has(key) {
+				failed = append(failed, key)
+				continue
+			}
+			instanceType = candidateInstanceType
+			offering = candidateOffering
+			break
+		}
+		if offering != nil {
+			break
+		}
+	}
+	if offering == nil {
+		return nil, cloudprovider.NewInsufficientCapacityError(
+			serrors.Wrap(fmt.Errorf("insufficient capacity"), "offerings", failed),
+			failed...,
+		)
+	}
 	// Labels
 	labels := map[string]string{}
 	for key, requirement := range instanceType.Requirements {
@@ -175,24 +213,13 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *v1.NodeClaim) (*v
 			labels[key] = requirement.Values()[0]
 		}
 	}
-	// Find offering, prioritizing reserved instances
-	var offering *cloudprovider.Offering
-	offerings := instanceType.Offerings.Available().Compatible(reqs)
-	lo.Must0(len(offerings) != 0, "created nodeclaim with no available offerings")
-	for _, o := range offerings {
-		// Only launch into a reserved offering that still has capacity. A full reservation stays Available (health) but
-		// is not launchable — matching the real provider, where reservation capacity and offering availability are
-		// independent axes (a full-but-healthy reservation is Available=true with ReservationCapacity=0). We do NOT
-		// flip Available on exhaustion; downstream scheduling/pricing already treats a zero-capacity reserved offering
-		// as non-launchable (see Offering.Launchable / offeringsToReserve).
-		if o.CapacityType() == v1.CapacityTypeReserved && o.ReservationCapacity > 0 {
-			o.ReservationCapacity -= 1
-			offering = o
-			break
-		}
-	}
-	if offering == nil {
-		offering = offerings[0]
+	// Only launch into a reserved offering that still has capacity. A full reservation stays Available (health) but
+	// is not launchable — matching the real provider, where reservation capacity and offering availability are
+	// independent axes (a full-but-healthy reservation is Available=true with ReservationCapacity=0). We do NOT
+	// flip Available on exhaustion; downstream scheduling/pricing already treats a zero-capacity reserved offering
+	// as non-launchable (see Offering.Launchable / offeringsToReserve).
+	if offering.CapacityType() == v1.CapacityTypeReserved && offering.ReservationCapacity > 0 {
+		offering.ReservationCapacity--
 	}
 	// Propagate labels dictated by offering requirements - e.g. zone, capacity-type, and reservation-id
 	for _, req := range offering.Requirements {

@@ -558,7 +558,7 @@ var _ = Describe("Ranking", func() {
 			ExpectApplied(ctx, env.Client, podActive, podStatic)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodeActive, nodeStatic}, []*v1.NodeClaim{ncActive, ncStatic})
 
-			nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider)
+			nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider, nil)
 			Expect(err).ToNot(HaveOccurred())
 			staticPool := &v1.NodePool{
 				ObjectMeta: metav1.ObjectMeta{Name: staticName},
