@@ -47,6 +47,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
@@ -56,14 +57,16 @@ type Controller struct {
 	cloudProvider cloudprovider.CloudProvider
 	provisioner   *provisioning.Provisioner
 	cluster       *state.Cluster
+	clock         clock.Clock
 }
 
-func NewController(kubeClient client.Client, cluster *state.Cluster, recorder events.Recorder, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache) *Controller {
+func NewController(kubeClient client.Client, cluster *state.Cluster, recorder events.Recorder, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache, launchBackoff *launchbackoff.Tracker) *Controller {
 	return &Controller{
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 		cluster:       cluster,
-		provisioner:   provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache),
+		clock:         clock,
+		provisioner:   provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, launchBackoff),
 	}
 }
 
@@ -107,19 +110,33 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 	log.FromContext(ctx).WithValues("current", runningNodeClaims, "desired", desiredReplicas, "provision-count", countNodeClaimsToProvision).
 		Info("provisioning nodeclaims to satisfy replica count")
 
-	nodeClaims := make([]*scheduling.NodeClaim, 0, countNodeClaimsToProvision)
-	for range countNodeClaimsToProvision {
-		nct := scheduling.NewNodeClaimTemplate(np)
-		nodeClaims = append(nodeClaims, &scheduling.NodeClaim{
-			NodeClaimTemplate: *nct,
-		})
-	}
+	return c.provision(ctx, np, countNodeClaimsToProvision)
+}
 
-	_, err := c.provisioner.CreateNodeClaims(ctx, nodeClaims, provisioning.WithReason(metrics.ProvisionedReason))
+func (c *Controller) provision(ctx context.Context, np *v1.NodePool, wanted int64) (reconcile.Result, error) {
+	nodeClaims := make([]*scheduling.NodeClaim, 0, wanted)
+	for range wanted {
+		nodeClaims = append(nodeClaims, &scheduling.NodeClaim{NodeClaimTemplate: *scheduling.NewNodeClaimTemplate(np)})
+	}
+	reservations, err := c.provisioner.ReserveNodeClaims(ctx, nodeClaims)
 	if err != nil {
-		return reconcile.Result{}, fmt.Errorf("creating nodeclaims, %w", err)
+		c.cluster.NodePoolState.ReleaseNodeCount(np.Name, wanted)
+		return reconcile.Result{}, err
+	}
+	if len(reservations.Omitted) > 0 {
+		c.cluster.NodePoolState.ReleaseNodeCount(np.Name, int64(len(reservations.Omitted)))
+		log.FromContext(ctx).WithValues("throttled-count", len(reservations.Omitted), "provision-count", len(reservations.Admitted)).
+			Info("withholding nodeclaims after insufficient capacity")
+	}
+	if len(reservations.Admitted) > 0 {
+		if _, err := c.provisioner.CreateNodeClaims(ctx, reservations.Admitted, provisioning.WithReason(metrics.ProvisionedReason)); err != nil {
+			return reconcile.Result{}, fmt.Errorf("creating nodeclaims, %w", err)
+		}
 	}
 
+	if len(reservations.Omitted) > 0 {
+		return reconcile.Result{RequeueAfter: max(reservations.NextEligible.Sub(c.clock.Now()), time.Second)}, nil
+	}
 	return reconcile.Result{RequeueAfter: time.Minute}, nil
 }
 

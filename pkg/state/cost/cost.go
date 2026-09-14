@@ -84,11 +84,10 @@ type NodePoolCost struct {
 }
 
 // OfferingKey uniquely identifies a specific compute offering by its zone,
-// capacity type (e.g., spot/on-demand), and instance type name.
-// This is not a hard invariant
-type OfferingKey struct {
-	Zone, CapacityType, InstanceName string
-}
+// capacity type (e.g., spot/on-demand), and instance type name. It is an alias of the
+// canonical key on cloudprovider so that cost accounting and launch backoff agree on what
+// "an offering" is.
+type OfferingKey = cloudprovider.OfferingKey
 
 // OfferingCount tracks the number and cost of instances for a specific offering.
 type OfferingCount struct {
@@ -140,7 +139,7 @@ func (cc *ClusterCost) internalUpdateOfferings(np *v1.NodePool, instanceTypes []
 	prices := make(map[OfferingKey]float64, len(instanceTypes)*3)
 	for _, it := range instanceTypes {
 		for _, o := range it.Offerings {
-			prices[OfferingKey{InstanceName: it.Name, Zone: o.Zone(), CapacityType: o.CapacityType()}] = o.Price
+			prices[OfferingKey{InstanceType: it.Name, Zone: o.Zone(), CapacityType: o.CapacityType()}] = o.Price
 		}
 	}
 
@@ -182,7 +181,7 @@ func (cc *ClusterCost) UpdateNodeClaim(ctx context.Context, nodeClaim *v1.NodeCl
 	}
 
 	nodePoolName := nodeClaim.Labels[v1.NodePoolLabelKey]
-	offeringKey := OfferingKey{CapacityType: nodeClaim.Labels[v1.CapacityTypeLabelKey], Zone: nodeClaim.Labels[corev1.LabelTopologyZone], InstanceName: nodeClaim.Labels[corev1.LabelInstanceTypeStable]}
+	offeringKey := OfferingKey{CapacityType: nodeClaim.Labels[v1.CapacityTypeLabelKey], Zone: nodeClaim.Labels[corev1.LabelTopologyZone], InstanceType: nodeClaim.Labels[corev1.LabelInstanceTypeStable]}
 
 	err := cc.internalAddOffering(ctx, nodePoolName, offeringKey)
 	if err != nil {
@@ -254,11 +253,11 @@ func (cc *ClusterCost) internalAddOffering(ctx context.Context, npName string, o
 	if !exists {
 		instanceTypes, err := cc.cloudProvider.GetInstanceTypes(ctx, np)
 		if err != nil {
-			return fmt.Errorf("failed to get instance types for nodepool %q while adding offering for instance %q, %w", np.Name, offeringKey.InstanceName, err)
+			return fmt.Errorf("failed to get instance types for nodepool %q while adding offering for instance %q, %w", np.Name, offeringKey.InstanceType, err)
 		}
 		price, found := findOfferingPrice(instanceTypes, offeringKey)
 		if !found {
-			log.FromContext(ctx).Error(fmt.Errorf("failed to find offering for instance %q in zone %q with capacity %q in nodepool %q", offeringKey.InstanceName, offeringKey.Zone, offeringKey.CapacityType, npName), "offering price unknown — cost tracking will undercount for this nodeclaim until next update")
+			log.FromContext(ctx).Error(fmt.Errorf("failed to find offering for instance %q in zone %q with capacity %q in nodepool %q", offeringKey.InstanceType, offeringKey.Zone, offeringKey.CapacityType, npName), "offering price unknown — cost tracking will undercount for this nodeclaim until next update")
 		}
 		oc = OfferingCount{Count: 0, Price: price}
 	}
@@ -274,12 +273,12 @@ func (cc *ClusterCost) internalAddOffering(ctx context.Context, npName string, o
 func (cc *ClusterCost) internalRemoveOffering(npName string, offeringKey OfferingKey) error {
 	npc, exists := cc.npCostMap[npName]
 	if !exists {
-		return fmt.Errorf("attempted to remove offering from nonexistent nodepool %q (instance, %q, zone, %q, capacity, %q)", npName, offeringKey.InstanceName, offeringKey.Zone, offeringKey.CapacityType)
+		return fmt.Errorf("attempted to remove offering from nonexistent nodepool %q (instance, %q, zone, %q, capacity, %q)", npName, offeringKey.InstanceType, offeringKey.Zone, offeringKey.CapacityType)
 	}
 
 	oc, exists := npc.offeringCounts[offeringKey]
 	if !exists {
-		return fmt.Errorf("attempted to remove nonexistent offering from nodepool %q (instance, %q, zone, %q, capacity, %q)", npName, offeringKey.InstanceName, offeringKey.Zone, offeringKey.CapacityType)
+		return fmt.Errorf("attempted to remove nonexistent offering from nodepool %q (instance, %q, zone, %q, capacity, %q)", npName, offeringKey.InstanceType, offeringKey.Zone, offeringKey.CapacityType)
 	}
 
 	oc.Count--
@@ -324,7 +323,7 @@ func (cc *ClusterCost) GetNodepoolCost(np *v1.NodePool) float64 {
 
 func findOfferingPrice(instanceTypes []*cloudprovider.InstanceType, key OfferingKey) (float64, bool) {
 	for _, it := range instanceTypes {
-		if it == nil || it.Name != key.InstanceName {
+		if it == nil || it.Name != key.InstanceType {
 			continue
 		}
 		return it.OfferingPrice(key.Zone, key.CapacityType)

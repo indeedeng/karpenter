@@ -36,8 +36,10 @@ import (
 	"go.uber.org/multierr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
@@ -58,6 +60,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -69,6 +72,12 @@ import (
 type LaunchOptions struct {
 	RecordPodNomination bool
 	Reason              string
+}
+
+type ReservationResults struct {
+	Admitted     []*scheduler.NodeClaim
+	Omitted      []*scheduler.NodeClaim
+	NextEligible time.Time
 }
 
 // RecordPodNomination causes nominate pod events to be recorded against the node.
@@ -92,11 +101,13 @@ type Provisioner struct {
 	clock                      clock.Clock
 	deviceAllocationController *deviceallocation.Controller
 	virtualPodCache            *virtualpods.Cache
+	launchBackoff              *launchbackoff.Tracker
 }
 
 func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 	cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster,
 	clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache,
+	launchBackoff *launchbackoff.Tracker,
 ) *Provisioner {
 	p := &Provisioner{
 		batcher:                    NewBatcher[types.UID](clock),
@@ -109,6 +120,7 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 		clock:                      clock,
 		deviceAllocationController: deviceAllocationController,
 		virtualPodCache:            virtualPodCache,
+		launchBackoff:              launchBackoff,
 	}
 	return p
 }
@@ -130,6 +142,10 @@ func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
 
 func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, err error) {
 	ctx = injection.WithControllerName(ctx, p.Name())
+
+	// Reclaim idle offering entries and expired unbound reservations. This is a small map sweep
+	// which can ride the existing provisioning singleton.
+	p.launchBackoff.GC()
 
 	// Batch pods
 	if triggered := p.batcher.Wait(ctx); !triggered {
@@ -160,12 +176,149 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 		p.cluster.UpdateBufferPodCounts(bufferPodCountsFromResults(results))
 	}
 	if len(results.NewNodeClaims) == 0 {
-		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+		return p.requeueForSchedulingResults(results, ReservationResults{}), nil
 	}
-	if _, err = p.CreateNodeClaims(ctx, results.NewNodeClaims, WithReason(metrics.ProvisionedReason), RecordPodNomination); err != nil {
+	reservations, err := p.ReserveNodeClaims(ctx, results.NewNodeClaims)
+	if err != nil {
+		return reconciler.Result{}, err
+	}
+	if len(reservations.Admitted) == 0 {
+		return p.requeueForSchedulingResults(results, reservations), nil
+	}
+	if _, err = p.CreateNodeClaims(ctx, reservations.Admitted, WithReason(metrics.ProvisionedReason), RecordPodNomination); err != nil {
 		return reconciler.Result{}, err
 	}
 	return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+}
+
+func (p *Provisioner) ReserveNodeClaims(ctx context.Context, nodeClaims []*scheduler.NodeClaim) (ReservationResults, error) {
+	return p.reserveNodeClaims(ctx, nodeClaims, false)
+}
+
+func (p *Provisioner) ReserveReplacementNodeClaims(ctx context.Context, nodeClaims []*scheduler.NodeClaim) (ReservationResults, error) {
+	return p.reserveNodeClaims(ctx, nodeClaims, true)
+}
+
+func (p *Provisioner) reserveNodeClaims(ctx context.Context, nodeClaims []*scheduler.NodeClaim, atomic bool) (ReservationResults, error) {
+	if !options.FromContext(ctx).FeatureGates.LaunchBackoff || p.launchBackoff.Empty() {
+		return ReservationResults{Admitted: nodeClaims}, nil
+	}
+
+	instanceTypes := map[string][]*cloudprovider.InstanceType{}
+	candidates := make(map[string][]cloudprovider.OfferingKey, len(nodeClaims))
+	claimsByID := make(map[string]*scheduler.NodeClaim, len(nodeClaims))
+	ids := make([]string, 0, len(nodeClaims))
+	for _, nodeClaim := range nodeClaims {
+		its, ok := instanceTypes[nodeClaim.NodePoolName]
+		if !ok {
+			nodePool := &v1.NodePool{}
+			if err := p.kubeClient.Get(ctx, client.ObjectKey{Name: nodeClaim.NodePoolName}, nodePool); err != nil {
+				return ReservationResults{}, fmt.Errorf("getting nodepool for launch reservation, %w", err)
+			}
+			var err error
+			its, err = p.cloudProvider.GetInstanceTypes(ctx, nodePool)
+			if err != nil {
+				return ReservationResults{}, fmt.Errorf("getting instance types for launch reservation, %w", err)
+			}
+			instanceTypes[nodeClaim.NodePoolName] = its
+		}
+		id := string(uuid.NewUUID())
+		ids = append(ids, id)
+		candidates[id] = launchbackoff.CandidateOfferings(nodeClaim.ToNodeClaim(), its)
+		claimsByID[id] = nodeClaim
+	}
+
+	results := ReservationResults{}
+	reservationResults := map[string]launchbackoff.ReservationResult{}
+	if atomic {
+		var admitted bool
+		reservationResults, admitted = p.launchBackoff.ReserveBatch(ctx, candidates)
+		if !admitted {
+			for id, nodeClaim := range claimsByID {
+				results.Omitted = append(results.Omitted, nodeClaim)
+				results.NextEligible = earliest(results.NextEligible, reservationResults[id].NextEligible)
+				capacityType := launchbackoff.ThrottledCapacityType(lo.Uniq(lo.Map(candidates[id], func(key cloudprovider.OfferingKey, _ int) string {
+					return key.CapacityType
+				})))
+				launchbackoff.NodePoolsLaunchThrottledTotal.Inc(map[string]string{
+					metrics.NodePoolLabel:     nodeClaim.NodePoolName,
+					metrics.ReasonLabel:       launchbackoff.ThrottledReasonOfferingBudget,
+					metrics.CapacityTypeLabel: capacityType,
+				})
+			}
+			return results, nil
+		}
+	} else {
+		for _, id := range ids {
+			reservationResults[id] = p.launchBackoff.Reserve(ctx, id, candidates[id])
+		}
+	}
+
+	for _, id := range ids {
+		nodeClaim := claimsByID[id]
+		result := reservationResults[id]
+		capacityType := launchbackoff.ThrottledCapacityType(lo.Uniq(lo.Map(candidates[id], func(key cloudprovider.OfferingKey, _ int) string {
+			return key.CapacityType
+		})))
+		if !result.Admitted {
+			results.Omitted = append(results.Omitted, nodeClaim)
+			results.NextEligible = earliest(results.NextEligible, result.NextEligible)
+			launchbackoff.NodePoolsLaunchThrottledTotal.Inc(map[string]string{
+				metrics.NodePoolLabel:     nodeClaim.NodePoolName,
+				metrics.ReasonLabel:       launchbackoff.ThrottledReasonOfferingBudget,
+				metrics.CapacityTypeLabel: capacityType,
+			})
+			continue
+		}
+		if result.DebitedOfferings > 0 {
+			launchbackoff.NodePoolsLaunchProbesTotal.Inc(map[string]string{
+				metrics.NodePoolLabel:     nodeClaim.NodePoolName,
+				metrics.CapacityTypeLabel: capacityType,
+			})
+			launchbackoff.NodePoolsLaunchProbeOfferings.Observe(float64(result.DebitedOfferings), map[string]string{
+				metrics.CapacityTypeLabel: capacityType,
+			})
+		}
+		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
+			v1.LaunchBackoffReservationAnnotationKey: id,
+		})
+		results.Admitted = append(results.Admitted, nodeClaim)
+	}
+	return results, nil
+}
+
+func (p *Provisioner) ReleaseNodeClaimReservations(nodeClaims []*scheduler.NodeClaim) {
+	for _, nodeClaim := range nodeClaims {
+		if id := nodeClaim.Annotations[v1.LaunchBackoffReservationAnnotationKey]; id != "" {
+			p.launchBackoff.Release(id)
+		}
+	}
+}
+
+func (p *Provisioner) requeueForSchedulingResults(results scheduler.Results, reservations ReservationResults) reconciler.Result {
+	for _, node := range results.ExistingNodes {
+		if len(node.Pods) != 0 {
+			return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}
+		}
+	}
+	if len(results.PodErrors) == 0 && len(reservations.Omitted) == 0 {
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}
+	}
+	if len(results.OfferingsUnavailableErrors()) != len(results.PodErrors) {
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}
+	}
+	wake := reservations.NextEligible
+	if wake.IsZero() || wake.After(p.clock.Now().Add(launchbackoff.ProbeInterval)) {
+		wake = p.clock.Now().Add(launchbackoff.ProbeInterval)
+	}
+	return reconciler.Result{RequeueAfter: max(wake.Sub(p.clock.Now()), time.Second)}
+}
+
+func earliest(current, candidate time.Time) time.Time {
+	if candidate.IsZero() || (!current.IsZero() && !candidate.Before(current)) {
+		return current
+	}
+	return candidate
 }
 
 // CreateNodeClaims launches nodes passed into the function in parallel. It returns a slice of the successfully created node
@@ -310,7 +463,11 @@ func (p *Provisioner) NewScheduler(
 			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, no resolved instance types found")
 			continue
 		}
-		instanceTypes[np.Name] = its
+		// Must happen before these reach NewTopology or the scheduler, both of which trigger the
+		// InstanceType precompute. FilterUnavailable copies the affected types, so the copy
+		// precomputes against the cleared Available flags rather than inheriting the provider's
+		// cached view.
+		instanceTypes[np.Name] = launchbackoff.FilterUnavailable(ctx, its, p.launchBackoff)
 	}
 
 	// Get volume topology requirements WITHOUT modifying pods.
@@ -466,9 +623,11 @@ func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts .
 	options := option.Resolve(opts...)
 	latest := &v1.NodePool{}
 	if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: n.NodePoolName}, latest); err != nil {
+		p.ReleaseNodeClaimReservations([]*scheduler.NodeClaim{n})
 		return "", fmt.Errorf("getting current resource usage, %w", err)
 	}
 	if err := latest.Spec.Limits.ExceededBy(p.cluster.NodePoolResourcesFor(n.NodePoolName)); err != nil {
+		p.ReleaseNodeClaimReservations([]*scheduler.NodeClaim{n})
 		return "", err
 	}
 	nodeClaim := n.ToNodeClaim()
@@ -476,6 +635,9 @@ func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts .
 	annotateNodeClaimWithNominatedPods(n, nodeClaim)
 
 	if err := p.kubeClient.Create(ctx, nodeClaim); err != nil {
+		if isDefinitiveCreateError(err) {
+			p.ReleaseNodeClaimReservations([]*scheduler.NodeClaim{n})
+		}
 		return "", err
 	}
 
@@ -516,6 +678,18 @@ func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts .
 		}
 	}
 	return nodeClaim.Name, nil
+}
+
+func isDefinitiveCreateError(err error) bool {
+	return apierrors.IsInvalid(err) ||
+		apierrors.IsBadRequest(err) ||
+		apierrors.IsNotFound(err) ||
+		apierrors.IsGone(err) ||
+		apierrors.IsForbidden(err) ||
+		apierrors.IsUnauthorized(err) ||
+		apierrors.IsMethodNotSupported(err) ||
+		apierrors.IsNotAcceptable(err) ||
+		apierrors.IsRequestEntityTooLargeError(err)
 }
 
 func instanceTypeList(names []string) string {

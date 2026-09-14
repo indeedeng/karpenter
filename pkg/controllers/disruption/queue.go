@@ -56,6 +56,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/launchbackoff"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
@@ -103,11 +104,12 @@ type Queue struct {
 	clock               clock.Clock
 	provisioner         *provisioning.Provisioner
 	backoff             *NodePoolBackoff
+	launchBackoff       *launchbackoff.Tracker
 }
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
 func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock,
-	provisioner *provisioning.Provisioner,
+	provisioner *provisioning.Provisioner, launchBackoff *launchbackoff.Tracker,
 ) *Queue {
 	queue := &Queue{
 		// nolint:staticcheck
@@ -120,6 +122,7 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 		clock:               clock,
 		provisioner:         provisioner,
 		backoff:             NewNodePoolBackoff(clock),
+		launchBackoff:       launchBackoff,
 	}
 	return queue
 }
@@ -364,6 +367,16 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	if q.HasAny(providerIDs...) {
 		return fmt.Errorf("candidate is being disrupted")
 	}
+	replacements := lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim })
+	if len(replacements) != 0 {
+		reservations, err := q.provisioner.ReserveReplacementNodeClaims(ctx, replacements)
+		if err != nil {
+			return fmt.Errorf("reserving replacement nodeclaims, %w", err)
+		}
+		if len(reservations.Omitted) != 0 {
+			return fmt.Errorf("replacement offerings are recovering from insufficient capacity")
+		}
+	}
 
 	log.FromContext(ctx).WithValues(append([]any{
 		"command", cmd.String(),
@@ -374,6 +387,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// If we get a failure marking some nodes as disrupted, if we are launching replacements, we shouldn't continue
 	// with disrupting the candidates. If it's just a delete operation, we can proceed
 	if markDisruptedErr != nil && (len(cmd.Replacements) > 0 || len(markedCandidates) == 0) {
+		q.provisioner.ReleaseNodeClaimReservations(replacements)
 		return serrors.Wrap(fmt.Errorf("marking disrupted, %w", markDisruptedErr), "command-id", cmd.ID)
 	}
 
