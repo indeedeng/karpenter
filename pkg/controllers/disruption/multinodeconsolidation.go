@@ -53,6 +53,7 @@ func NewMultiNodeConsolidation(c consolidation, opts ...option.Function[MethodOp
 // nolint:gocyclo
 func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	if m.IsConsolidated() {
+		passObservationFromContext(ctx).MarkUnchanged()
 		return []Command{}, nil
 	}
 	candidates = m.sortCandidates(ctx, candidates)
@@ -90,6 +91,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 				// If there's disruptions allowed for the candidate's nodepool,
 				// add it to the list of candidates, and decrement the budget.
 				if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+					passObservationFromContext(ctx).MarkBudgetBlocked(candidate)
 					constrainedByBudgets = true
 					continue
 				}
@@ -99,6 +101,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 				if len(candidate.reschedulablePods) == 0 {
 					continue
 				}
+				passObservationFromContext(ctx).RecordBudgetEligible(candidate)
 				// set constrainedByBudgets to true if any node was a candidate but was constrained by a budget
 				disruptableCandidates = append(disruptableCandidates, candidate)
 				disruptionBudgetMapping[candidate.NodePool.Name]--
@@ -107,6 +110,9 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 			// Only consider a maximum batch of 100 NodeClaims to save on computation.
 			// This could be further configurable in the future.
 			maxParallel := lo.Clamp(len(disruptableCandidates), 0, 100)
+			if maxParallel < len(disruptableCandidates) {
+				passObservationFromContext(ctx).MarkSearchLimited(disruptableCandidates[maxParallel:]...)
+			}
 
 			cmd, perPoolResults, err := m.firstNConsolidationOption(ctx, disruptableCandidates, maxParallel)
 			if err != nil {
@@ -126,10 +132,13 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 
 			if cmd, err = m.validator.Validate(ctx, cmd, commandValidationDelay); err != nil {
 				if IsValidationError(err) {
+					passObservationFromContext(ctx).MarkValidationFailed()
+					passObservationFromContext(ctx).RecordOpportunity(cmd, OpportunityDispositionValidationFailed)
 					reason := getValidationFailureReason(err)
 					cmd.EmitRejectedEvents(m.recorder, reason)
 					return []Command{}, nil
 				}
+				passObservationFromContext(ctx).RecordOpportunity(cmd, OpportunityDispositionError)
 				return []Command{}, fmt.Errorf("validating consolidation, %w", err)
 			}
 			log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).WithValues("NewNodes", len(cmd.Replacements), "ReplacedNodes", len(cmd.Candidates)).Info("multi-node consolidation cmd success")
@@ -180,6 +189,7 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 		// context deadline exceeded will return to the top of the loop and either return nothing or the last saved command
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
+				passObservationFromContext(ctx).MarkTimeout()
 				ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: m.ConsolidationType()})
 				if lastSavedCommand.Candidates == nil {
 					log.FromContext(ctx).V(1).Info("failed to find a multi-node consolidation after timeout", "last_batch_size", (min+max)/2)
@@ -199,12 +209,15 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 			// we check the error before the replacement instanceTypeOptions since we return nil for the replacement if we get an error
 			if err == nil && len(cmd.Replacements[0].InstanceTypeOptions) > 0 {
 				validDecision = true
+			} else if err != nil {
+				passObservationFromContext(ctx).RecordOpportunity(cmd, OpportunityDispositionError)
 			}
 		}
 		// Score the move: Balanced pools may reject; other policies pass through.
 		if validDecision {
 			if approved, perPool := m.evaluator.ApproveCommand(ctx, cmd); !approved {
 				validDecision = false
+				passObservationFromContext(ctx).RecordOpportunity(cmd, OpportunityDispositionPolicyRejected)
 				lastRejectedCmd = cmd
 				lastRejectedPerPool = perPool
 			} else if perPool != nil {
@@ -213,6 +226,9 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 		}
 		if validDecision {
 			// We can consolidate NodeClaims [0,mid]
+			if lastSavedCommand.Candidates != nil {
+				passObservationFromContext(ctx).RecordOpportunity(lastSavedCommand, OpportunityDispositionSuperseded)
+			}
 			lastSavedCommand = cmd
 			min = mid + 1
 		} else {
@@ -226,6 +242,10 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 		m.evaluator.EmitMultiNodeEvents(ctx, lastRejectedCmd, lastRejectedPerPool, false)
 	}
 	return lastSavedCommand, lastSavedPerPool, nil
+}
+
+func (m *MultiNodeConsolidation) Name() string {
+	return MethodMulti
 }
 
 // filterOutSameInstanceType filters out instance types that are more expensive than the cheapest instance type that is being

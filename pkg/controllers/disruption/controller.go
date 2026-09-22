@@ -193,13 +193,24 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
 }
 
-func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
+func (c *Controller) disrupt(ctx context.Context, disruption Method) (success bool, retErr error) {
+	observation := NewPassObservation(disruption, c.clock)
+	ctx = WithPassObservation(ctx, observation)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panic(recovered)
+		}
+		// An interrupted outer reconciliation is not a completed method pass.
+		if ctx.Err() == nil {
+			observation.Complete(success, retErr)
+		}
+	}()
 	defer metrics.Measure(EvaluationDurationSeconds, map[string]string{
 		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
 		ConsolidationTypeLabel: disruption.ConsolidationType(),
 	})()
 	candidateDiscoveryStart := time.Now()
-	candidates, nodePoolTotals, err := GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
+	candidateSet, nodePoolTotals, err := GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
 	if _, ok := disruption.(*Drift); ok {
 		CandidateDiscoveryDurationSeconds.Observe(time.Since(candidateDiscoveryStart).Seconds(), map[string]string{
 			metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
@@ -209,6 +220,8 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	if err != nil {
 		return false, fmt.Errorf("determining candidates, %w", err)
 	}
+	observation.SetCandidates(candidateSet)
+	candidates := candidateSet.Eligible
 	EligibleNodes.Set(float64(len(candidates)), map[string]string{
 		metrics.ReasonLabel: strings.ToLower(string(disruption.Reason())),
 	})
@@ -247,6 +260,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		// Attempt to disrupt
 		if err := c.queue.StartCommand(ctx, &cmd); err != nil {
 			errs[i] = fmt.Errorf("disrupting candidates, %w", err)
+			return
 		}
 		// emit event for the consolidation
 		if cmd.Message != "" {

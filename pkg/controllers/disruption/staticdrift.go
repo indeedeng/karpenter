@@ -62,7 +62,18 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		np := npCandidates[0].NodePool
 
 		if disruptionBudgetMapping[npName] == 0 {
+			for _, candidate := range npCandidates {
+				passObservationFromContext(ctx).MarkBudgetBlocked(candidate)
+			}
 			continue
+		}
+		budgetEligibleCount := min(disruptionBudgetMapping[npName], len(npCandidates))
+		for i, candidate := range npCandidates {
+			if i < budgetEligibleCount {
+				passObservationFromContext(ctx).RecordBudgetEligible(candidate)
+			} else {
+				passObservationFromContext(ctx).MarkBudgetBlocked(candidate)
+			}
 		}
 
 		limit, ok := np.Spec.Limits[resources.Node]
@@ -103,6 +114,10 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		}
 	}
 	return cmds, nil
+}
+
+func (d *StaticDrift) Name() string {
+	return MethodStaticDrift
 }
 
 func (d *StaticDrift) Reason() v1.DisruptionReason {

@@ -113,9 +113,11 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 	orderedCandidates := slices.Concat(emptyCandidates, nonEmptyCandidates)
 	for i, candidate := range orderedCandidates {
 		if len(commands) == DriftMaxBatchSize {
+			passObservationFromContext(ctx).MarkSearchLimited(orderedCandidates[i:]...)
 			break
 		}
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			passObservationFromContext(ctx).MarkTimeout()
 			logDriftDeadline(ctx, i, len(orderedCandidates), len(commands))
 			break
 		}
@@ -126,13 +128,16 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		// If the disruption budget doesn't allow this candidate to be disrupted,
 		// continue to the next candidate.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			passObservationFromContext(ctx).MarkBudgetBlocked(candidate)
 			continue
 		}
+		passObservationFromContext(ctx).RecordBudgetEligible(candidate)
 		// Skip candidates whose NodePool is currently backed off after repeated unrecoverable
 		// drift replacement failures. Healthy pools and pools whose back-off window has elapsed
 		// fall through to normal selection. This is a read-only check; the queue is the only
 		// place that mutates back-off state (Fail/Reset). Disabled when NodePoolDriftBackoff is off.
 		if options.FromContext(ctx).FeatureGates.NodePoolDriftBackoff && d.backoff != nil && d.backoff.IsBackedOff(candidate.NodePool.Name) {
+			passObservationFromContext(ctx).MarkPolicySkipped(candidate)
 			level, until := d.backoff.Snapshot(candidate.NodePool.Name)
 			d.recorder.Publish(disruptionevents.NodePoolDriftBackoff(candidate.NodePool, until, level))
 			continue
@@ -142,6 +147,7 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 			ledger.CommitRemoval([]string{candidate.Name()}, nil)
 			disruptionBudgetMapping[candidate.NodePool.Name]--
 			if legacyMode {
+				passObservationFromContext(ctx).MarkSelectedEarly(orderedCandidates[i+1:]...)
 				break
 			}
 			continue
@@ -151,6 +157,7 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 			simulator, err = newDriftReplacementSimulator(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder)
 			if err != nil {
 				if errors.Is(err, context.DeadlineExceeded) {
+					passObservationFromContext(ctx).MarkTimeout()
 					logDriftDeadline(ctx, i, len(orderedCandidates), len(commands))
 					break
 				}
@@ -161,9 +168,10 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		if simulateReplacement == nil {
 			simulateReplacement = simulator.simulate
 		}
-		results, scheduler, err := simulateReplacement(ctx, candidate, ledger)
+		results, scheduler, err := simulateReplacement(WithSimulationStage(ctx, SimulationStageEvaluation), candidate, ledger)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
+				passObservationFromContext(ctx).MarkTimeout()
 				logDriftDeadline(ctx, i+1, len(orderedCandidates), len(commands))
 				break
 			}
@@ -189,6 +197,7 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		ledger.Commit(scheduler, results, []string{candidate.Name()}, acceptedPods)
 		disruptionBudgetMapping[candidate.NodePool.Name]--
 		if legacyMode {
+			passObservationFromContext(ctx).MarkSelectedEarly(orderedCandidates[i+1:]...)
 			break
 		}
 	}
@@ -210,6 +219,10 @@ func newDriftCommand(candidate *Candidate, results scheduling.Results) Command {
 		Results:             results,
 		PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
 	}
+}
+
+func (d *Drift) Name() string {
+	return MethodDrift
 }
 
 func (d *Drift) Reason() v1.DisruptionReason {

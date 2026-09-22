@@ -524,6 +524,7 @@ func (p *Provisioner) newScheduler(
 	catalog *SchedulerCatalog,
 	opts ...scheduler.Options,
 ) (*scheduler.Scheduler, error) {
+	report := scheduler.SimulationReportFromOptions(opts...)
 	if catalog == nil {
 		var err error
 		catalog, err = p.NewSchedulerCatalog(ctx)
@@ -535,7 +536,9 @@ func (p *Provisioner) newScheduler(
 	// Get volume topology requirements WITHOUT modifying pods.
 	// Volume requirements are passed separately and added to nodeRequirements only.
 	// Pods that fail volume topology lookup are excluded from scheduling.
+	volumeTopologyStarted := time.Now()
 	pods, volumeReqs, err := p.getVolumeTopologyRequirements(ctx, pods)
+	report.RecordPhase(scheduler.SimulationPhaseVolumeTopologyLookup, time.Since(volumeTopologyStarted))
 	if err != nil {
 		return nil, fmt.Errorf("getting volume topology requirements, %w", err)
 	}
@@ -550,17 +553,21 @@ func (p *Provisioner) newScheduler(
 	// scheduler) so the same filtering can be reused by other schedulers, e.g. disruption. When DRA support is disabled,
 	// the allocator is left nil and the scheduler short-circuits DRA pods.
 	var allocator *dynamicresources.Allocator
+	dynamicResourceStarted := time.Now()
 	if !options.FromContext(ctx).IgnoreDRARequests {
 		inClusterSlices, err := p.gatherResourceSlices(ctx, stateNodes)
 		if err != nil {
+			report.RecordPhase(scheduler.SimulationPhaseDynamicResourceSetup, time.Since(dynamicResourceStarted))
 			return nil, fmt.Errorf("gathering resourceslices, %w", err)
 		}
 		allocatedDevices, err := p.gatherAllocatedDevices(ctx, deletingPodUIDs)
 		if err != nil {
+			report.RecordPhase(scheduler.SimulationPhaseDynamicResourceSetup, time.Since(dynamicResourceStarted))
 			return nil, fmt.Errorf("gathering allocated devices, %w", err)
 		}
 		allocator = dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(catalog.instanceTypes), p.kubeClient, deletingPodUIDs)
 	}
+	report.RecordPhase(scheduler.SimulationPhaseDynamicResourceSetup, time.Since(dynamicResourceStarted))
 
 	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
 	return scheduler.NewScheduler(ctx, p.kubeClient, catalog.nodePools, p.cluster, accountingNodes, topology, catalog.instanceTypes, catalog.daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, opts...), nil

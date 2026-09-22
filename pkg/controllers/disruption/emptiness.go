@@ -63,6 +63,7 @@ func (e *Emptiness) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 //nolint:gocyclo
 func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	if e.IsConsolidated() {
+		passObservationFromContext(ctx).MarkUnchanged()
 		return []Command{}, nil
 	}
 	candidates = e.sortCandidates(ctx, candidates)
@@ -74,10 +75,12 @@ func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping
 			continue
 		}
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			passObservationFromContext(ctx).MarkBudgetBlocked(candidate)
 			// set constrainedByBudgets to true if any node was a candidate but was constrained by a budget
 			constrainedByBudgets = true
 			continue
 		}
+		passObservationFromContext(ctx).RecordBudgetEligible(candidate)
 		// If there's disruptions allowed for the candidate's nodepool,
 		// add it to the list of candidates, and decrement the budget.
 		empty = append(empty, candidate)
@@ -101,12 +104,17 @@ func (e *Emptiness) ComputeCommands(ctx context.Context, disruptionBudgetMapping
 	validCmd, err := e.validator.Validate(ctx, cmd, commandValidationDelay)
 	if err != nil {
 		if IsValidationError(err) {
+			passObservationFromContext(ctx).MarkValidationFailed()
 			log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).Info("abandoning empty node consolidation attempt due to pod churn, command is no longer valid")
 			return []Command{}, nil
 		}
 		return []Command{}, err
 	}
 	return []Command{validCmd}, nil
+}
+
+func (e *Emptiness) Name() string {
+	return MethodEmpty
 }
 
 func (e *Emptiness) Reason() v1.DisruptionReason {

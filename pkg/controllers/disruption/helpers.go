@@ -18,8 +18,10 @@ package disruption
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -53,7 +55,36 @@ var errCandidateDeleting = fmt.Errorf("candidate is deleting")
 //nolint:gocyclo
 func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
 	schedulerOpts []scheduling.Options, candidates ...*Candidate,
-) (scheduling.Results, error) {
+) (results scheduling.Results, err error) {
+	observation := passObservationFromContext(ctx)
+	stage := simulationStageFromContext(ctx)
+	if observation != nil {
+		if stage == SimulationStageEvaluation {
+			observation.RecordEvaluation(candidates...)
+		}
+		CandidateBatchSize.Observe(float64(len(candidates)), map[string]string{
+			methodLabel: observation.method.Name(),
+			stageLabel:  stage,
+		})
+		started := time.Now()
+		defer func() {
+			outcome := simulationOutcome(results, err)
+			if outcome == SimulationOutcomeTimeout {
+				observation.MarkTimeout()
+			}
+			SimulationDurationSeconds.Observe(time.Since(started).Seconds(), map[string]string{
+				methodLabel:  observation.method.Name(),
+				stageLabel:   stage,
+				outcomeLabel: outcome,
+			})
+			SimulationsTotal.Inc(map[string]string{
+				methodLabel:           observation.method.Name(),
+				metrics.NodePoolLabel: candidateNodePoolScope(candidates...),
+				stageLabel:            stage,
+				outcomeLabel:          outcome,
+			})
+		}()
+	}
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
 	nodes := cluster.DeepCopyNodes()
 	deletingNodes := nodes.Deleting()
@@ -75,6 +106,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
 	}
+	pendingPods := append([]*corev1.Pod(nil), pods...)
 
 	// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
 	// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until
@@ -101,6 +133,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		return scheduling.Results{}, fmt.Errorf("failed to get pods from deleting nodes, %w", err)
 	}
 	pods = append(pods, deletingNodePods...)
+	observeSimulationPodCounts(observation, stage, pendingPods, candidatePods, deletingNodePods, nil)
 
 	var opts []scheduling.Options
 	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
@@ -108,6 +141,14 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	}
 	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
 	opts = append(opts, schedulerOpts...)
+	var simulationReport *scheduling.SimulationReport
+	if observation != nil {
+		simulationReport = scheduling.NewSimulationReport()
+		opts = append(opts, scheduling.WithSimulationReport(simulationReport))
+		defer func() {
+			observeSimulationReport(observation, simulationReport.Stats())
+		}()
+	}
 	// Both consolidation candidate pods and pods on already-deleting nodes are migrating off their current nodes, so
 	// the DRA allocator should treat the devices they hold as available for reallocation (and re-allocate their claims).
 	deletingPodUIDs := sets.New(lo.Map(append(candidatePods, deletingNodePods...), func(p *corev1.Pod, _ int) types.UID { return p.UID })...)
@@ -126,7 +167,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		return client.ObjectKeyFromObject(p), nil
 	})
 
-	results, err := scheduler.Solve(log.IntoContext(ctx, operatorlogging.NopLogger), pods)
+	results, err = scheduler.Solve(log.IntoContext(ctx, operatorlogging.NopLogger), pods)
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("scheduling pods, %w", err)
 	}
@@ -152,6 +193,130 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		}
 	}
 	return results, nil
+}
+
+func simulationOutcome(results scheduling.Results, err error) string {
+	switch {
+	case err == nil && results.AllNonPendingPodsScheduled():
+		return SimulationOutcomeSchedulable
+	case err == nil:
+		return SimulationOutcomeUnschedulable
+	case errors.Is(err, errCandidateDeleting):
+		return SimulationOutcomeCandidateDeleting
+	case errors.Is(err, context.DeadlineExceeded):
+		return SimulationOutcomeTimeout
+	default:
+		return SimulationOutcomeError
+	}
+}
+
+func observeSimulationPodCounts(observation *PassObservation, stage string, pending, candidate, deleting, excluded []*corev1.Pod) {
+	if observation == nil {
+		return
+	}
+	bySource := map[string][]*corev1.Pod{
+		SimulationPodSourcePending:   pending,
+		SimulationPodSourceCandidate: candidate,
+		SimulationPodSourceDeleting:  deleting,
+		SimulationPodSourceExcluded:  excluded,
+	}
+	total := sets.New[string]()
+	for source, pods := range bySource {
+		keys := sets.New[string]()
+		for _, pod := range pods {
+			keys.Insert(podKey(pod))
+		}
+		total.Insert(keys.UnsortedList()...)
+		SimulationPodCount.Observe(float64(keys.Len()), map[string]string{
+			methodLabel: observation.method.Name(),
+			stageLabel:  stage,
+			sourceLabel: source,
+		})
+	}
+	SimulationPodCount.Observe(float64(total.Len()), map[string]string{
+		methodLabel: observation.method.Name(),
+		stageLabel:  stage,
+		sourceLabel: SimulationPodSourceTotal,
+	})
+}
+
+func observeSimulationReport(observation *PassObservation, stats scheduling.SimulationStats) {
+	if observation == nil {
+		return
+	}
+	method := observation.method.Name()
+	phases := map[string]time.Duration{
+		SimulationPhaseTopologyBuild:        stats.Phases.TopologyBuild,
+		SimulationPhaseSchedulerBuild:       stats.Phases.SchedulerBuild,
+		SimulationPhasePodDataPreparation:   stats.Phases.PodDataPreparation,
+		SimulationPhaseScheduling:           stats.Phases.Scheduling,
+		SimulationPhaseResultFinalization:   stats.Phases.ResultFinalization,
+		SimulationPhaseSolve:                stats.Phases.Solve,
+		SimulationPhaseVolumeTopologyLookup: stats.Phases.VolumeTopologyLookup,
+		SimulationPhaseDynamicResourceSetup: stats.Phases.DynamicResourceSetup,
+	}
+	for phase, duration := range phases {
+		if duration > 0 {
+			SimulationPhaseDurationSeconds.Observe(duration.Seconds(), map[string]string{
+				methodLabel: method,
+				phaseLabel:  phase,
+			})
+		}
+	}
+	for kind, count := range map[string]uint64{
+		TopologyConstraintKindSpread:              stats.Topology.SpreadGroups,
+		TopologyConstraintKindAffinity:            stats.Topology.AffinityGroups,
+		TopologyConstraintKindAntiAffinity:        stats.Topology.AntiAffinityGroups,
+		TopologyConstraintKindInverseAntiAffinity: stats.Topology.InverseAntiAffinityGroups,
+	} {
+		SimulationTopologyConstraintCount.Observe(float64(count), map[string]string{
+			methodLabel: method,
+			kindLabel:   kind,
+		})
+	}
+	SimulationTopologyKeyCount.Observe(float64(stats.Topology.DistinctKeys), map[string]string{methodLabel: method})
+
+	for kind, count := range map[string]uint64{
+		SimulationInputKindPod:                   stats.Inputs.Pods,
+		SimulationInputKindTopologyStateNode:     stats.Inputs.TopologyStateNodes,
+		SimulationInputKindAccountingStateNode:   stats.Inputs.AccountingStateNodes,
+		SimulationInputKindNodePool:              stats.Inputs.NodePools,
+		SimulationInputKindNodePoolTemplate:      stats.Inputs.NodePoolTemplates,
+		SimulationInputKindInstanceType:          stats.Inputs.InstanceTypes,
+		SimulationInputKindDaemonSetPod:          stats.Inputs.DaemonSetPods,
+		SimulationInputKindAdditionalExcludedPod: stats.Inputs.AdditionalExcludedPods,
+	} {
+		SimulationInputCount.Observe(float64(count), map[string]string{
+			methodLabel: method,
+			kindLabel:   kind,
+		})
+	}
+	for operation, count := range map[string]uint64{
+		SimulationOperationPodAttempt:             stats.Work.PodAttempts,
+		SimulationOperationPreferenceRelaxation:   stats.Work.PreferenceRelaxations,
+		SimulationOperationExistingNodeCheck:      stats.Work.ExistingNodeChecks,
+		SimulationOperationInflightNodeClaimCheck: stats.Work.InflightNodeClaimChecks,
+		SimulationOperationNodePoolTemplateCheck:  stats.Work.NodePoolTemplateChecks,
+		SimulationOperationTopologyMatchCheck:     stats.Work.TopologyMatchChecks,
+		SimulationOperationTopologyAPIRead:        stats.Work.TopologyAPIReads,
+	} {
+		SimulationWorkCount.Observe(float64(count), map[string]string{
+			methodLabel:    method,
+			operationLabel: operation,
+		})
+	}
+	for kind, count := range map[string]uint64{
+		SimulationResultKindNewNodeClaim:      stats.Results.NewNodeClaims,
+		SimulationResultKindExistingNode:      stats.Results.ExistingNodes,
+		SimulationResultKindPodOnNewNodeClaim: stats.Results.PodsOnNewNodeClaims,
+		SimulationResultKindPodOnExistingNode: stats.Results.PodsOnExistingNodes,
+		SimulationResultKindPodError:          stats.Results.PodErrors,
+	} {
+		SimulationResultCount.Observe(float64(count), map[string]string{
+			methodLabel: method,
+			kindLabel:   kind,
+		})
+	}
 }
 
 type driftReplacementSimulator struct {
@@ -184,8 +349,41 @@ func newDriftReplacementSimulator(ctx context.Context, kubeClient client.Client,
 	}, nil
 }
 
-func (s *driftReplacementSimulator) simulate(ctx context.Context, candidate *Candidate, ledger *scheduling.BatchLedger) (scheduling.Results, *scheduling.Scheduler, error) {
+func (s *driftReplacementSimulator) simulate(ctx context.Context, candidate *Candidate, ledger *scheduling.BatchLedger) (results scheduling.Results, scheduler *scheduling.Scheduler, err error) {
 	defer metrics.Measure(DriftReplacementSimulationDurationSeconds, nil)()
+	observation := passObservationFromContext(ctx)
+	stage := simulationStageFromContext(ctx)
+	if observation != nil {
+		if stage == SimulationStageEvaluation {
+			observation.RecordEvaluation(candidate)
+		}
+		CandidateBatchSize.Observe(1, map[string]string{
+			methodLabel: observation.method.Name(),
+			stageLabel:  stage,
+		})
+		SimulationInputCount.Observe(float64(ledger.RemovedNodeNames().Len()), map[string]string{
+			methodLabel: observation.method.Name(),
+			kindLabel:   SimulationInputKindPriorRemovedCandidate,
+		})
+		started := time.Now()
+		defer func() {
+			outcome := simulationOutcome(results, err)
+			if outcome == SimulationOutcomeTimeout {
+				observation.MarkTimeout()
+			}
+			SimulationDurationSeconds.Observe(time.Since(started).Seconds(), map[string]string{
+				methodLabel:  observation.method.Name(),
+				stageLabel:   stage,
+				outcomeLabel: outcome,
+			})
+			SimulationsTotal.Inc(map[string]string{
+				methodLabel:           observation.method.Name(),
+				metrics.NodePoolLabel: candidateNodePoolScope(candidate),
+				stageLabel:            stage,
+				outcomeLabel:          outcome,
+			})
+		}()
+	}
 	if !s.cluster.IsNodeActive(candidate.ProviderID()) {
 		return scheduling.Results{}, nil, errCandidateDeleting
 	}
@@ -193,6 +391,7 @@ func (s *driftReplacementSimulator) simulate(ctx context.Context, candidate *Can
 	pods := lo.Filter(candidate.reschedulablePods, func(pod *corev1.Pod, _ int) bool {
 		return s.pdbs.IsCurrentlyReschedulable(pod, s.clock, s.recorder)
 	})
+	observeSimulationPodCounts(observation, stage, nil, pods, nil, ledger.RemovedPods())
 	removedNodeNames := ledger.RemovedNodeNames()
 	removedNodeNames.Insert(candidate.Name())
 	accountingNodes := lo.Filter(s.nodes.Active(), func(node *state.StateNode, _ int) bool {
@@ -208,7 +407,15 @@ func (s *driftReplacementSimulator) simulate(ctx context.Context, candidate *Can
 		opts = append(opts, scheduling.IgnorePreferences)
 	}
 	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
-	scheduler, err := s.provisioner.NewReplacementScheduler(
+	var simulationReport *scheduling.SimulationReport
+	if observation != nil {
+		simulationReport = scheduling.NewSimulationReport()
+		opts = append(opts, scheduling.WithSimulationReport(simulationReport))
+		defer func() {
+			observeSimulationReport(observation, simulationReport.Stats())
+		}()
+	}
+	scheduler, err = s.provisioner.NewReplacementScheduler(
 		log.IntoContext(ctx, operatorlogging.NopLogger),
 		pods,
 		s.nodes.Active(),
@@ -222,7 +429,7 @@ func (s *driftReplacementSimulator) simulate(ctx context.Context, candidate *Can
 	if err != nil {
 		return scheduling.Results{}, nil, fmt.Errorf("creating scheduler, %w", err)
 	}
-	results, err := scheduler.Solve(log.IntoContext(ctx, operatorlogging.NopLogger), pods)
+	results, err = scheduler.Solve(log.IntoContext(ctx, operatorlogging.NopLogger), pods)
 	if err != nil {
 		return results, scheduler, fmt.Errorf("scheduling pods, %w", err)
 	}
@@ -264,24 +471,34 @@ func instanceTypesAreSubset(lhs []*cloudprovider.InstanceType, rhs []*cloudprovi
 func GetCandidates(ctx context.Context, cluster *state.Cluster, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
 	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue,
 ) ([]*Candidate, error) {
-	candidates, _, err := GetCandidatesWithTotals(ctx, cluster, kubeClient, recorder, clk, cloudProvider, shouldDisrupt, disruptionClass, queue, nil)
-	return candidates, err
+	candidateSet, _, err := GetCandidatesWithTotals(ctx, cluster, kubeClient, recorder, clk, cloudProvider, shouldDisrupt, disruptionClass, queue, nil)
+	return candidateSet.Eligible, err
 }
 
-// GetCandidatesWithTotals returns candidates and NodePoolTotals computed from all
-// candidates before filtering, so balanced scoring normalizes against the full pool.
+// CandidateSet captures the candidate funnel for a single disruption method pass.
+// Possible candidates passed common candidate construction, while Eligible candidates
+// additionally passed the method-specific filter.
+type CandidateSet struct {
+	Possible  []*Candidate
+	Eligible  []*Candidate
+	NodePools []string
+}
+
+// GetCandidatesWithTotals returns the candidate funnel and NodePoolTotals computed
+// from all possible candidates before method filtering, so balanced scoring
+// normalizes against the full pool.
 // When clusterCost is non-nil, TotalCost is read from precomputed cluster state
 // rather than re-summed from candidates.
 func GetCandidatesWithTotals(ctx context.Context, cluster *state.Cluster, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
 	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue, clusterCost *cost.ClusterCost,
-) ([]*Candidate, map[string]NodePoolTotals, error) {
+) (CandidateSet, map[string]NodePoolTotals, error) {
 	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMap(ctx, kubeClient, cloudProvider, queue.launchBackoff)
 	if err != nil {
-		return nil, nil, err
+		return CandidateSet{}, nil, err
 	}
 	pdbs, err := pdb.NewLimits(ctx, kubeClient)
 	if err != nil {
-		return nil, nil, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
+		return CandidateSet{}, nil, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
 	}
 	allNodes := cluster.DeepCopyNodes()
 	allCandidates := lo.FilterMap(allNodes, func(n *state.StateNode, _ int) (*Candidate, bool) {
@@ -292,7 +509,11 @@ func GetCandidatesWithTotals(ctx context.Context, cluster *state.Cluster, kubeCl
 	// "Non-candidate nodes still contribute to the denominators").
 	nodePoolTotals := computeNodePoolTotals(ctx, allCandidates, stateNodesToSlice(allNodes), clusterCost)
 	filtered := lo.Filter(allCandidates, func(c *Candidate, _ int) bool { return shouldDisrupt(ctx, c) })
-	return filtered, nodePoolTotals, nil
+	return CandidateSet{
+		Possible:  allCandidates,
+		Eligible:  filtered,
+		NodePools: lo.Keys(nodePoolMap),
+	}, nodePoolTotals, nil
 }
 
 // stateNodesToSlice converts StateNodes to []*StateNode for computeNodePoolTotals.

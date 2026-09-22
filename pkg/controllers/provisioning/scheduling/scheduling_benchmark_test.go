@@ -108,6 +108,16 @@ func BenchmarkIgnorePreferences(b *testing.B) {
 	benchmarkScheduler(b, makePreferencePods(4000), scheduling.IgnorePreferences)
 }
 
+func BenchmarkSimulationReport(b *testing.B) {
+	pods := makeDiversePods(500)
+	b.Run("disabled", func(b *testing.B) {
+		benchmarkScheduler(b, pods)
+	})
+	b.Run("enabled", func(b *testing.B) {
+		benchmarkScheduler(b, pods, scheduling.WithSimulationReport(scheduling.NewSimulationReport()))
+	})
+}
+
 // TestSchedulingProfile is used to gather profiling metrics, benchmarking is primarily done with standard
 // Go benchmark functions
 // go test -tags=test_performance -run=SchedulingProfile

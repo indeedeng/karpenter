@@ -104,6 +104,29 @@ var _ = Describe("Emptiness", func() {
 			ExpectMetricGaugeValue(disruption.EligibleNodes, 1, map[string]string{
 				metrics.ReasonLabel: "empty",
 			})
+			for stage := range map[string]struct{}{
+				disruption.CandidateStagePossible:       {},
+				disruption.CandidateStageEligible:       {},
+				disruption.CandidateStageBudgetEligible: {},
+			} {
+				ExpectMetricGaugeValue(disruption.Candidates, 1, map[string]string{
+					"method":              disruption.MethodEmpty,
+					metrics.NodePoolLabel: nodePool.Name,
+					"stage":               stage,
+				})
+			}
+			ExpectMetricCounterValue(disruption.PassesTotal, 1, map[string]string{
+				"method":  disruption.MethodEmpty,
+				"outcome": disruption.PassOutcomeSelected,
+			})
+			ExpectMetricCounterValue(disruption.SelectedCandidatesTotal, 1, map[string]string{
+				"method":              disruption.MethodEmpty,
+				metrics.NodePoolLabel: nodePool.Name,
+				"decision":            string(disruption.DeleteDecision),
+			})
+			ExpectMetricGaugeValue(disruption.LastEvaluatedTimestampSeconds, float64(env.Clock.Now().Unix()), map[string]string{
+				"method": disruption.MethodEmpty,
+			})
 		})
 	})
 	Context("Budgets", func() {

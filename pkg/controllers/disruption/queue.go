@@ -359,7 +359,12 @@ func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) e
 // 1. Taint candidate nodes
 // 2. Spin up replacement nodes
 // 3. Add Command to the queue to wait to delete the candidates.
-func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
+func (q *Queue) StartCommand(ctx context.Context, cmd *Command) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			passObservationFromContext(ctx).RecordQueueRejected(*cmd)
+		}
+	}()
 	// First check if we can add the command.
 	providerIDs := lo.Map(cmd.Candidates, func(c *Candidate, _ int) string {
 		return c.ProviderID()
@@ -448,6 +453,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		metrics.ReasonLabel:    strings.ToLower(string(cmd.Reason())),
 		ConsolidationTypeLabel: cmd.ConsolidationType(),
 	})
+	passObservationFromContext(ctx).RecordSelected(*cmd)
 	return nil
 }
 

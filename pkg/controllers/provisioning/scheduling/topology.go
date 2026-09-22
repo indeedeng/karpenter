@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/awslabs/operatorpkg/serrors"
@@ -63,6 +64,7 @@ type Topology struct {
 	excludedPods sets.Set[string]
 	cluster      *state.Cluster
 	stateNodes   []*state.StateNode
+	report       *SimulationReport
 }
 
 func NewTopology(
@@ -75,7 +77,20 @@ func NewTopology(
 	pods []*corev1.Pod,
 	opts ...Options,
 ) (*Topology, error) {
+	started := time.Now()
 	resolvedOptions := option.Resolve(opts...)
+	if resolvedOptions.simulationReport != nil {
+		defer resolvedOptions.simulationReport.addDuration(&resolvedOptions.simulationReport.topologyBuildNanos, started)
+		resolvedOptions.simulationReport.inputPods.Store(uint64(len(pods)))
+		resolvedOptions.simulationReport.topologyStateNodes.Store(uint64(len(stateNodes)))
+		resolvedOptions.simulationReport.nodePools.Store(uint64(len(nodePools)))
+		resolvedOptions.simulationReport.additionalExcludedPods.Store(uint64(len(resolvedOptions.additionalExcludedPods)))
+		var instanceTypeCount uint64
+		for _, types := range instanceTypes {
+			instanceTypeCount += uint64(len(types))
+		}
+		resolvedOptions.simulationReport.instanceTypes.Store(instanceTypeCount)
+	}
 	t := &Topology{
 		kubeClient:            kubeClient,
 		preferencePolicy:      resolvedOptions.preferencePolicy,
@@ -85,6 +100,7 @@ func NewTopology(
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[uint64]*TopologyGroup{},
 		excludedPods:          sets.New[string](),
+		report:                resolvedOptions.simulationReport,
 	}
 
 	allPods := make([]*corev1.Pod, 0, len(pods)+len(resolvedOptions.additionalExcludedPods))
@@ -101,9 +117,45 @@ func NewTopology(
 		errs = multierr.Append(errs, t.Update(ctx, p))
 	}
 	if errs != nil {
+		t.captureInitialTopologyStats()
 		return nil, errs
 	}
+	t.captureInitialTopologyStats()
 	return t, nil
+}
+
+func (t *Topology) captureInitialTopologyStats() {
+	if t.report == nil {
+		return
+	}
+	var spread, affinity, antiAffinity, inverseAntiAffinity uint64
+	keys := sets.New[string]()
+	for _, group := range t.topologyGroups {
+		if len(group.owners) == 0 {
+			continue
+		}
+		keys.Insert(group.Key)
+		switch group.Type {
+		case TopologyTypeSpread:
+			spread++
+		case TopologyTypePodAffinity:
+			affinity++
+		case TopologyTypePodAntiAffinity:
+			antiAffinity++
+		}
+	}
+	for _, group := range t.inverseTopologyGroups {
+		if len(group.owners) == 0 {
+			continue
+		}
+		keys.Insert(group.Key)
+		inverseAntiAffinity++
+	}
+	t.report.spreadGroups.Store(spread)
+	t.report.affinityGroups.Store(affinity)
+	t.report.antiAffinityGroups.Store(antiAffinity)
+	t.report.inverseAntiAffinityGroups.Store(inverseAntiAffinity)
+	t.report.distinctTopologyKeys.Store(uint64(keys.Len()))
 }
 
 func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*cloudprovider.InstanceType) map[string]TopologyDomainGroup {
@@ -369,6 +421,9 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 	// simultaneously)
 	var pods []corev1.Pod
 	for _, ns := range tg.namespaces.UnsortedList() {
+		if t.report != nil {
+			t.report.topologyAPIReads.Add(1)
+		}
 		if err := t.kubeClient.List(ctx, podList, TopologyListOptions(ns, tg.rawSelector)); err != nil {
 			return fmt.Errorf("listing pods, %w", err)
 		}
@@ -421,6 +476,9 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 			nodeRequirements = previousNodeRequirements
 		} else {
 			node = &corev1.Node{}
+			if t.report != nil {
+				t.report.topologyAPIReads.Add(1)
+			}
 			if err := t.kubeClient.Get(ctx, types.NamespacedName{Name: p.Spec.NodeName}, node); err != nil {
 				// Pods that cannot be evicted can be leaked in the API Server after
 				// a Node is removed. Since pod bindings are immutable, these pods
@@ -549,6 +607,9 @@ func (t *Topology) buildNamespaceList(ctx context.Context, namespace string, nam
 	if err != nil {
 		return nil, fmt.Errorf("parsing selector, %w", err)
 	}
+	if t.report != nil {
+		t.report.topologyAPIReads.Add(1)
+	}
 	if err := t.kubeClient.List(ctx, &namespaceList, &client.ListOptions{LabelSelector: labelSelector}); err != nil {
 		return nil, fmt.Errorf("listing namespaces, %w", err)
 	}
@@ -565,11 +626,17 @@ func (t *Topology) buildNamespaceList(ctx context.Context, namespace string, nam
 func (t *Topology) getMatchingTopologies(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) []*TopologyGroup {
 	var matchingTopologies []*TopologyGroup
 	for _, tg := range t.topologyGroups {
+		if t.report != nil {
+			t.report.topologyMatchChecks.Add(1)
+		}
 		if tg.IsOwnedBy(p.UID) {
 			matchingTopologies = append(matchingTopologies, tg)
 		}
 	}
 	for _, tg := range t.inverseTopologyGroups {
+		if t.report != nil {
+			t.report.topologyMatchChecks.Add(1)
+		}
 		if tg.Counts(p, taints, requirements, compatibilityOptions...) {
 			matchingTopologies = append(matchingTopologies, tg)
 		}

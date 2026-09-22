@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/awslabs/operatorpkg/option"
@@ -101,6 +102,7 @@ type options struct {
 	replacementOnly         bool
 	batchLedger             *BatchLedger
 	additionalExcludedPods  []*corev1.Pod
+	simulationReport        *SimulationReport
 }
 
 type Options = option.Function[options]
@@ -157,6 +159,15 @@ func WithAdditionalExcludedPods(pods ...*corev1.Pod) Options {
 	}
 }
 
+// WithSimulationReport opts a scheduling simulation into structured reporting.
+// The caller retains the report and may snapshot it after construction or Solve
+// returns, including error and timeout paths.
+func WithSimulationReport(report *SimulationReport) Options {
+	return func(opts *options) {
+		opts.simulationReport = report
+	}
+}
+
 func NewScheduler(
 	ctx context.Context,
 	kubeClient client.Client,
@@ -172,7 +183,11 @@ func NewScheduler(
 	allocator *dynamicresources.Allocator,
 	opts ...Options,
 ) *Scheduler {
+	started := time.Now()
 	resolvedOptions := option.Resolve(opts...)
+	if resolvedOptions.simulationReport != nil {
+		defer resolvedOptions.simulationReport.addDuration(&resolvedOptions.simulationReport.schedulerBuildNanos, started)
+	}
 	minValuesPolicy := resolvedOptions.minValuesPolicy
 
 	// if any of the nodePools add a taint with a prefer no schedule effect, we add a toleration for the taint
@@ -233,6 +248,18 @@ func NewScheduler(
 		instanceTypes:           instanceTypes,
 		cachedResourceClaims:    map[types.NamespacedName]*resourcev1.ResourceClaim{},
 		replacementOnly:         resolvedOptions.replacementOnly,
+		simulationReport:        resolvedOptions.simulationReport,
+	}
+	if s.simulationReport != nil {
+		s.simulationReport.accountingStateNodes.Store(uint64(len(stateNodes)))
+		s.simulationReport.nodePools.Store(uint64(len(nodePools)))
+		s.simulationReport.nodePoolTemplates.Store(uint64(len(templates) + len(unavailableTemplates)))
+		s.simulationReport.daemonSetPods.Store(uint64(len(daemonSetPods)))
+		var instanceTypeCount uint64
+		for _, types := range instanceTypes {
+			instanceTypeCount += uint64(len(types))
+		}
+		s.simulationReport.instanceTypes.Store(instanceTypeCount)
 	}
 	if resolvedOptions.batchLedger != nil {
 		s.reservationManager = resolvedOptions.batchLedger.reservationManagerFor(instanceTypes)
@@ -305,6 +332,7 @@ type Scheduler struct {
 	instanceTypes map[string][]*cloudprovider.InstanceType
 	// cachedResourceClaims memoizes ResourceClaim lookups for the duration of a single scheduling loop.
 	cachedResourceClaims map[types.NamespacedName]*resourcev1.ResourceClaim
+	simulationReport     *SimulationReport
 }
 
 // DRAError indicates a pod will not be attempted to be scheduled because it has Dynamic Resource Allocation requirements
@@ -494,6 +522,15 @@ func (r Results) TruncateInstanceTypes(ctx context.Context, maxInstanceTypes int
 //nolint:gocyclo
 func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, error) {
 	defer metrics.Measure(DurationSeconds, map[string]string{ControllerLabel: injection.GetControllerName(ctx)})()
+	solveStarted := time.Now()
+	var results Results
+	if s.simulationReport != nil {
+		s.simulationReport.inputPods.Store(uint64(len(pods)))
+		defer s.simulationReport.addDuration(&s.simulationReport.solveNanos, solveStarted)
+		defer func() {
+			s.simulationReport.setResults(results)
+		}()
+	}
 	// We loop trying to schedule unschedulable pods as long as we are making progress.  This solves a few
 	// issues including pods with affinity to another pod in the batch. We could topo-sort to solve this, but it wouldn't
 	// solve the problem of scheduling pods where a particular order is needed to prevent a max-skew violation. E.g. if we
@@ -505,6 +542,7 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 	PendingPodsByEffectiveZone.DeletePartialMatch(map[string]string{ControllerLabel: injection.GetControllerName(ctx)})
 	QueueDepth.DeletePartialMatch(map[string]string{ControllerLabel: injection.GetControllerName(ctx)})
 	podCountByZone := make(map[string]int)
+	podDataStarted := time.Now()
 	for _, p := range pods {
 		s.updateCachedPodData(ctx, p)
 		if p.Status.Phase == corev1.PodPending {
@@ -512,10 +550,14 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 			podCountByZone[zone]++
 		}
 	}
+	if s.simulationReport != nil {
+		s.simulationReport.addDuration(&s.simulationReport.podDataPreparationNanos, podDataStarted)
+	}
 
 	q := NewQueue(pods, s.cachedPodData)
 
 	startTime := s.clock.Now()
+	schedulingStarted := time.Now()
 	for {
 		UnfinishedWorkSeconds.Set(s.clock.Since(startTime).Seconds(), map[string]string{ControllerLabel: injection.GetControllerName(ctx), schedulingIDLabel: string(s.uuid)})
 		QueueDepth.Set(float64(len(q.pods)), map[string]string{ControllerLabel: injection.GetControllerName(ctx), schedulingIDLabel: string(s.uuid)})
@@ -544,7 +586,11 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 			delete(podErrors, pod)
 		}
 	}
+	if s.simulationReport != nil {
+		s.simulationReport.addDuration(&s.simulationReport.schedulingNanos, schedulingStarted)
+	}
 	UnfinishedWorkSeconds.Delete(map[string]string{ControllerLabel: injection.GetControllerName(ctx), schedulingIDLabel: string(s.uuid)})
+	finalizationStarted := time.Now()
 	for _, m := range s.newNodeClaims {
 		m.FinalizeScheduling(s.draDriversForNodeClaim(m)...)
 	}
@@ -557,7 +603,7 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 		})
 	}
 
-	results := Results{
+	results = Results{
 		NewNodeClaims: s.newNodeClaims,
 		ExistingNodes: s.existingNodes,
 		PodErrors:     podErrors,
@@ -570,6 +616,9 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 			},
 		)
 	}
+	if s.simulationReport != nil {
+		s.simulationReport.addDuration(&s.simulationReport.resultFinalizationNanos, finalizationStarted)
+	}
 	return results, ctx.Err()
 }
 
@@ -577,6 +626,9 @@ func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) error {
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if s.simulationReport != nil {
+			s.simulationReport.podAttempts.Add(1)
 		}
 		err := s.add(ctx, p)
 		if err == nil {
@@ -597,6 +649,9 @@ func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) error {
 		// Eventually we won't be able to relax anymore and this while loop will exit
 		if relaxed := s.preferences.Relax(ctx, p); !relaxed {
 			return err
+		}
+		if s.simulationReport != nil {
+			s.simulationReport.preferenceRelaxations.Add(1)
 		}
 		if e := s.topology.Update(ctx, p); e != nil && !errors.Is(e, context.DeadlineExceeded) {
 			log.FromContext(ctx).Error(e, "failed updating topology")
@@ -681,6 +736,7 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod) error 
 	var existingNode *ExistingNode
 	var requirements scheduling.Requirements
 	var allocationResult *dynamicresources.AllocationResult
+	var checks atomic.Uint64
 
 	// determine the volumes that will be mounted if the pod schedules
 	volumes, err := scheduling.GetVolumes(ctx, s.kubeClient, p)
@@ -692,6 +748,9 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod) error 
 			// We shouldn't try to schedule candidate pods onto nodes that are under consolidate after.
 			// Pending pods and pods from deleting nodes are exempt.
 			return true
+		}
+		if s.simulationReport != nil {
+			checks.Add(1)
 		}
 		r, result, err := s.existingNodes[i].CanAdd(ctx, p, s.cachedPodData[p.UID], volumes, s.allocator)
 		if err == nil {
@@ -710,6 +769,9 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod) error 
 		}
 		return true
 	})
+	if s.simulationReport != nil {
+		s.simulationReport.existingNodeChecks.Add(checks.Load())
+	}
 	// If we set the existingNode to something valid, this means that we successfully scheduled to one of these nodes
 	if existingNode != nil {
 		existingNode.Add(ctx, p, s.cachedPodData[p.UID], requirements, volumes, allocationResult)
@@ -727,7 +789,11 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 	var updatedInstanceTypes []*cloudprovider.InstanceType
 	var offeringsToReserve []*cloudprovider.Offering
 	var allocationResult *dynamicresources.AllocationResult
+	var checks atomic.Uint64
 	parallelizeUntil(s.numConcurrentReconciles, len(s.newNodeClaims), func(i int) bool {
+		if s.simulationReport != nil {
+			checks.Add(1)
+		}
 		r, its, ofr, result, err := s.newNodeClaims[i].CanAdd(ctx, pod, s.cachedPodData[pod.UID], false, s.allocator)
 		if err == nil {
 			mu.Lock()
@@ -747,6 +813,9 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 		}
 		return true
 	})
+	if s.simulationReport != nil {
+		s.simulationReport.inflightNodeClaimChecks.Add(checks.Load())
+	}
 	if inflightNodeClaim != nil {
 		inflightNodeClaim.Add(ctx, pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, offeringsToReserve, allocationResult, s.allocator)
 		return nil
@@ -756,6 +825,9 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 
 func (s *Scheduler) offeringsUnavailableError(ctx context.Context, pod *corev1.Pod) error {
 	for _, template := range s.unavailableTemplates {
+		if s.simulationReport != nil {
+			s.simulationReport.nodePoolTemplateChecks.Add(1)
+		}
 		nodeClaim := NewNodeClaim(template, s.topology, s.daemonOverheadGroups[template], template.InstanceTypeOptions, s.reservationManager, s.reservedOfferingMode)
 		_, _, _, _, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort, s.allocator)
 		if IsOfferingsUnavailableError(err) {
@@ -777,7 +849,11 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 	var allocationResult *dynamicresources.AllocationResult
 
 	errs := make([]error, len(s.nodeClaimTemplates))
+	var checks atomic.Uint64
 	parallelizeUntil(s.numConcurrentReconciles, len(s.nodeClaimTemplates), func(i int) bool {
+		if s.simulationReport != nil {
+			checks.Add(1)
+		}
 		its := s.nodeClaimTemplates[i].InstanceTypeOptions
 		// if limits have been applied to the nodepool, ensure we filter instance types to avoid violating those limits
 		if remaining, ok := s.remainingResources[s.nodeClaimTemplates[i].NodePoolName]; ok {
@@ -853,6 +929,9 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 		idx = i
 		return false
 	})
+	if s.simulationReport != nil {
+		s.simulationReport.nodePoolTemplateChecks.Add(checks.Load())
+	}
 	if newNodeClaim != nil {
 		// we will launch this nodeClaim and need to track its maximum possible resource usage against our remaining resources
 		newNodeClaim.Add(ctx, pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, offeringsToReserve, allocationResult, s.allocator)

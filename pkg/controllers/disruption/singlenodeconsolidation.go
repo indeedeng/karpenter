@@ -54,6 +54,7 @@ func NewSingleNodeConsolidation(c consolidation, opts ...option.Function[MethodO
 // nolint:gocyclo
 func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	if s.IsConsolidated() {
+		passObservationFromContext(ctx).MarkUnchanged()
 		return []Command{}, nil
 	}
 	candidates = s.SortCandidates(ctx, candidates)
@@ -66,6 +67,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 
 	for i, candidate := range candidates {
 		if s.clock.Now().After(timeout) {
+			passObservationFromContext(ctx).MarkTimeout()
 			ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: s.ConsolidationType()})
 			log.FromContext(ctx).V(1).Info("abandoning single-node consolidation due to timeout", "candidates_evaluated", i)
 
@@ -80,12 +82,15 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		// continue to the next candidate. We don't need to decrement any budget
 		// counter since single node consolidation commands can only have one candidate.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			passObservationFromContext(ctx).MarkBudgetBlocked(candidate)
 			constrainedByBudgets = true
 			continue
 		}
+		passObservationFromContext(ctx).RecordBudgetEligible(candidate)
 		// Skip candidates whose best-case score (delete ratio) cannot pass the
 		// threshold. A DELETE is the upper bound; if it fails, no REPLACE will pass.
 		if !s.evaluator.CanPassThreshold(candidate) {
+			passObservationFromContext(ctx).MarkPolicySkipped(candidate)
 			continue
 		}
 
@@ -100,14 +105,18 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		}
 		// Score the move: Balanced pools may reject; other policies pass through.
 		if approved, _ := s.evaluator.ApproveCommand(ctx, cmd); !approved {
+			passObservationFromContext(ctx).RecordOpportunity(cmd, OpportunityDispositionPolicyRejected)
 			continue
 		}
 		if _, err = s.validator.Validate(ctx, cmd, commandValidationDelay); err != nil {
 			if IsValidationError(err) {
+				passObservationFromContext(ctx).MarkValidationFailed()
+				passObservationFromContext(ctx).RecordOpportunity(cmd, OpportunityDispositionValidationFailed)
 				reason := getValidationFailureReason(err)
 				cmd.EmitRejectedEvents(s.recorder, reason)
 				return []Command{}, nil
 			}
+			passObservationFromContext(ctx).RecordOpportunity(cmd, OpportunityDispositionError)
 			return []Command{}, fmt.Errorf("validating consolidation, %w", err)
 		}
 		return []Command{cmd}, nil
@@ -123,6 +132,10 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	s.PreviouslyUnseenNodePools = unseenNodePools
 
 	return []Command{}, nil
+}
+
+func (s *SingleNodeConsolidation) Name() string {
+	return MethodSingle
 }
 
 func (s *SingleNodeConsolidation) Reason() v1.DisruptionReason {

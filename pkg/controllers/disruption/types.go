@@ -61,6 +61,7 @@ func WithValidator(v Validator) option.Function[MethodOptions] {
 }
 
 type Method interface {
+	Name() string
 	ShouldDisrupt(context.Context, *Candidate) bool
 	ComputeCommands(context.Context, map[string]int, ...*Candidate) ([]Command, error)
 	Reason() v1.DisruptionReason
@@ -84,6 +85,9 @@ type Candidate struct {
 	// Price is the cheapest compatible offering price for this candidate.
 	// Precomputed at creation to avoid repeated offering lookups.
 	Price float64
+	// PriceKnown distinguishes a valid zero price from a missing source offering.
+	// Opportunity metrics require this to avoid presenting incomplete prices as savings.
+	PriceKnown bool
 	// RescheduleDisruptionCost is 1.0 (base) + sum of positive pod eviction costs
 	// for reschedulable pods. Used by balanced scoring.
 	RescheduleDisruptionCost float64
@@ -114,18 +118,23 @@ func (r ScoreResult) Approved() bool     { return r.Score() >= r.Threshold() }
 // offering that matches the node's zone and capacity-type labels.
 // Returns 0 when the instance type is nil or no matching offering exists.
 func resolveNodePrice(node *state.StateNode, instanceType *cloudprovider.InstanceType) float64 {
+	price, _ := resolveNodePriceWithStatus(node, instanceType)
+	return price
+}
+
+func resolveNodePriceWithStatus(node *state.StateNode, instanceType *cloudprovider.InstanceType) (float64, bool) {
 	if instanceType == nil {
-		return 0
+		return 0, false
 	}
 	labels := node.Labels()
 	price, ok := instanceType.OfferingPrice(labels[corev1.LabelTopologyZone], labels[v1.CapacityTypeLabelKey])
 	if !ok {
-		return 0
+		return 0, false
 	}
 	if math.IsNaN(price) {
-		return 0
+		return 0, false
 	}
-	return price
+	return price, true
 }
 
 // PerNodeBaseDisruptionCost is the inherent cost of draining a node (cordon,
@@ -215,6 +224,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		}
 	}
 	reschedulable := lo.Filter(pods, func(p *corev1.Pod, _ int) bool { return pod.IsReschedulable(p) })
+	price, priceKnown := resolveNodePriceWithStatus(node, instanceType)
 	return &Candidate{
 		StateNode:         node,
 		instanceType:      instanceType,
@@ -224,7 +234,8 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		reschedulablePods: reschedulable,
 		// We get the disruption cost from all pods in the candidate, not just the reschedulable pods
 		DisruptionCost:           disruptionutils.ReschedulingCost(ctx, pods) * disruptionutils.LifetimeRemaining(clk, nodePool, node.NodeClaim),
-		Price:                    resolveNodePrice(node, instanceType),
+		Price:                    price,
+		PriceKnown:               priceKnown,
 		RescheduleDisruptionCost: computeRescheduleDisruptionCost(ctx, reschedulable),
 	}, nil
 }
