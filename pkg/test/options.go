@@ -53,15 +53,16 @@ type OptionsFields struct {
 }
 
 type FeatureGates struct {
-	NodeRepair               *bool
-	ReservedCapacity         *bool
-	SpotToSpotConsolidation  *bool
-	NodeOverlay              *bool
-	StaticCapacity           *bool
-	CapacityBuffer           *bool
-	NodePoolDriftBackoff     *bool
-	LaunchBackoff            *bool
-	DriftReplacementBatching *bool
+	NodeRepair                *bool
+	ReservedCapacity          *bool
+	SpotToSpotConsolidation   *bool
+	NodeOverlay               *bool
+	StaticCapacity            *bool
+	CapacityBuffer            *bool
+	NodePoolDriftBackoff      *bool
+	LaunchBackoff             *bool
+	DriftReplacementBatching  *bool
+	DisruptionSimulationReuse *bool
 }
 
 func Options(overrides ...OptionsFields) *options.Options {
@@ -93,15 +94,16 @@ func Options(overrides ...OptionsFields) *options.Options {
 		MinValuesPolicy:                  lo.FromPtrOr(opts.MinValuesPolicy, options.MinValuesPolicyStrict),
 		IgnoreDRARequests:                lo.FromPtrOr(opts.IgnoreDRARequests, true),
 		FeatureGates: options.FeatureGates{
-			NodeRepair:               lo.FromPtrOr(opts.FeatureGates.NodeRepair, false),
-			ReservedCapacity:         lo.FromPtrOr(opts.FeatureGates.ReservedCapacity, true),
-			SpotToSpotConsolidation:  lo.FromPtrOr(opts.FeatureGates.SpotToSpotConsolidation, false),
-			NodeOverlay:              lo.FromPtrOr(opts.FeatureGates.NodeOverlay, false),
-			StaticCapacity:           lo.FromPtrOr(opts.FeatureGates.StaticCapacity, false),
-			CapacityBuffer:           lo.FromPtrOr(opts.FeatureGates.CapacityBuffer, false),
-			NodePoolDriftBackoff:     lo.FromPtrOr(opts.FeatureGates.NodePoolDriftBackoff, true),
-			LaunchBackoff:            lo.FromPtrOr(opts.FeatureGates.LaunchBackoff, false),
-			DriftReplacementBatching: lo.FromPtrOr(opts.FeatureGates.DriftReplacementBatching, true),
+			NodeRepair:                lo.FromPtrOr(opts.FeatureGates.NodeRepair, false),
+			ReservedCapacity:          lo.FromPtrOr(opts.FeatureGates.ReservedCapacity, true),
+			SpotToSpotConsolidation:   lo.FromPtrOr(opts.FeatureGates.SpotToSpotConsolidation, false),
+			NodeOverlay:               lo.FromPtrOr(opts.FeatureGates.NodeOverlay, false),
+			StaticCapacity:            lo.FromPtrOr(opts.FeatureGates.StaticCapacity, false),
+			CapacityBuffer:            lo.FromPtrOr(opts.FeatureGates.CapacityBuffer, false),
+			NodePoolDriftBackoff:      lo.FromPtrOr(opts.FeatureGates.NodePoolDriftBackoff, true),
+			LaunchBackoff:             lo.FromPtrOr(opts.FeatureGates.LaunchBackoff, false),
+			DriftReplacementBatching:  lo.FromPtrOr(opts.FeatureGates.DriftReplacementBatching, true),
+			DisruptionSimulationReuse: lo.FromPtrOr(opts.FeatureGates.DisruptionSimulationReuse, false),
 		},
 	}
 }
