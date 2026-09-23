@@ -105,6 +105,7 @@ type options struct {
 	replacementOnly           bool
 	batchLedger               *BatchLedger
 	additionalExcludedPods    []*corev1.Pod
+	preparedSchedulerInputs   *PreparedSchedulerInputs
 }
 
 type Options = option.Function[options]
@@ -172,6 +173,13 @@ func WithAdditionalExcludedPods(pods ...*corev1.Pod) Options {
 	}
 }
 
+// WithPreparedSchedulerInputs reuses immutable construction work while keeping all solve state fresh.
+func WithPreparedSchedulerInputs(prepared *PreparedSchedulerInputs) Options {
+	return func(opts *options) {
+		opts.preparedSchedulerInputs = prepared
+	}
+}
+
 func NewScheduler(
 	ctx context.Context,
 	kubeClient client.Client,
@@ -190,60 +198,75 @@ func NewScheduler(
 	resolved := option.Resolve(opts...)
 	minValuesPolicy := resolved.minValuesPolicy
 
-	// Seed the reservation manager, then credit back any slots the caller expects a disruption candidate to free on
-	// termination (terminate-first "would the pods fit once freed?" pass).
-	reservationManager := NewReservationManager(instanceTypes)
+	var templates []*NodeClaimTemplate
+	var unavailableTemplates []*NodeClaimTemplate
+	var daemonOverheadGroups map[*NodeClaimTemplate][]DaemonOverheadGroup
+	var remainingResources map[string]corev1.ResourceList
+	var reservationManager *ReservationManager
+	toleratePreferNoSchedule := false
+	if resolved.preparedSchedulerInputs != nil {
+		prepared := resolved.preparedSchedulerInputs
+		templates = prepared.templates
+		unavailableTemplates = prepared.unavailableTemplates
+		daemonOverheadGroups = prepared.daemonOverheadGroups
+		remainingResources = prepared.cloneRemainingResources()
+		toleratePreferNoSchedule = prepared.toleratePreferNoSchedule
+		reservationManager = prepared.reservationManager.Clone()
+	} else {
+		// if any of the nodePools add a taint with a prefer no schedule effect, we add a toleration for the taint
+		// during preference relaxation
+		for _, np := range nodePools {
+			for _, taint := range np.Spec.Template.Spec.Taints {
+				if taint.Effect == corev1.TaintEffectPreferNoSchedule {
+					toleratePreferNoSchedule = true
+				}
+			}
+		}
+		// Pre-filter instance types eligible for NodePools to reduce work done during scheduling loops for pods
+		// if no templates remain, we still want to build the scheduler so that Karpenter can ack pods which can schedule to existing and in-flight capacity
+		templates = lo.FilterMap(nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
+			var err error
+			nct := NewNodeClaimTemplate(np)
+			nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(instanceTypes[np.Name], nct.Requirements, &corev1.Pod{}, corev1.ResourceList{}, []DaemonOverheadGroup{{InstanceTypes: instanceTypes[np.Name], HostPortUsage: scheduling.NewHostPortUsage()}}, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
+			if len(nct.InstanceTypeOptions) == 0 {
+				if IsOfferingsUnavailableError(err) {
+					nct.InstanceTypeOptions = instanceTypes[np.Name]
+					unavailableTemplates = append(unavailableTemplates, nct)
+				}
+				if instanceTypeFilterErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeFilterErr.minValuesIncompatibleErr != nil {
+					recorder.Publish(NoCompatibleInstanceTypes(np, true))
+					log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types", "minValuesIncompatibleErr", instanceTypeFilterErr.minValuesIncompatibleErr)
+				} else {
+					recorder.Publish(NoCompatibleInstanceTypes(np, false))
+					log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types")
+				}
+				return nil, false
+			}
+			return nct, true
+		})
+		daemonOverheadGroups = buildDaemonOverheadGroups(ctx, append(append([]*NodeClaimTemplate{}, templates...), unavailableTemplates...), daemonSetPods)
+		remainingResources = lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
+			return np.Name, corev1.ResourceList(np.Spec.Limits)
+		})
+		reservationManager = NewReservationManager(instanceTypes)
+	}
+	// Credit back any slots the caller expects a disruption candidate to free on termination (terminate-first "would
+	// the pods fit once freed?" pass).
 	for reservationID, count := range resolved.creditReservationCapacity {
 		reservationManager.Credit(reservationID, count)
 	}
-
-	// if any of the nodePools add a taint with a prefer no schedule effect, we add a toleration for the taint
-	// during preference relaxation
-	toleratePreferNoSchedule := false
-	for _, np := range nodePools {
-		for _, taint := range np.Spec.Template.Spec.Taints {
-			if taint.Effect == corev1.TaintEffectPreferNoSchedule {
-				toleratePreferNoSchedule = true
-			}
-		}
-	}
-	// Pre-filter instance types eligible for NodePools to reduce work done during scheduling loops for pods
-	// if no templates remain, we still want to build the scheduler so that Karpenter can ack pods which can schedule to existing and in-flight capacity
-	var unavailableTemplates []*NodeClaimTemplate
-	templates := lo.FilterMap(nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
-		var err error
-		nct := NewNodeClaimTemplate(np)
-		nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(instanceTypes[np.Name], nct.Requirements, &corev1.Pod{}, corev1.ResourceList{}, []DaemonOverheadGroup{{InstanceTypes: instanceTypes[np.Name], HostPortUsage: scheduling.NewHostPortUsage()}}, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
-		if len(nct.InstanceTypeOptions) == 0 {
-			if IsOfferingsUnavailableError(err) {
-				nct.InstanceTypeOptions = instanceTypes[np.Name]
-				unavailableTemplates = append(unavailableTemplates, nct)
-			}
-			if instanceTypeFilterErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeFilterErr.minValuesIncompatibleErr != nil {
-				recorder.Publish(NoCompatibleInstanceTypes(np, true))
-				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types", "minValuesIncompatibleErr", instanceTypeFilterErr.minValuesIncompatibleErr)
-			} else {
-				recorder.Publish(NoCompatibleInstanceTypes(np, false))
-				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types")
-			}
-			return nil, false
-		}
-		return nct, true
-	})
 	s := &Scheduler{
-		uuid:                 uuid.NewUUID(),
-		kubeClient:           kubeClient,
-		nodeClaimTemplates:   templates,
-		topology:             topology,
-		cluster:              cluster,
-		daemonOverheadGroups: buildDaemonOverheadGroups(ctx, append(append([]*NodeClaimTemplate{}, templates...), unavailableTemplates...), daemonSetPods),
-		cachedPodData:        map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
-		volumeReqsByPod:      volumeReqsByPod,          // Volume requirements per pod
-		recorder:             recorder,
-		preferences:          &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
-		remainingResources: lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
-			return np.Name, corev1.ResourceList(np.Spec.Limits)
-		}),
+		uuid:                      uuid.NewUUID(),
+		kubeClient:                kubeClient,
+		nodeClaimTemplates:        templates,
+		topology:                  topology,
+		cluster:                   cluster,
+		daemonOverheadGroups:      daemonOverheadGroups,
+		cachedPodData:             map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
+		volumeReqsByPod:           volumeReqsByPod,          // Volume requirements per pod
+		recorder:                  recorder,
+		preferences:               &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
+		remainingResources:        remainingResources,
 		clock:                     clock,
 		reservationManager:        reservationManager,
 		reservedOfferingMode:      resolved.reservedOfferingMode,
@@ -261,23 +284,27 @@ func NewScheduler(
 		s.reservationManager = resolved.batchLedger.reservationManagerFor(instanceTypes)
 	}
 
-	npByName := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
-		return np.Name, np
-	})
-
-	nodeToNodePool := lo.SliceToMap(stateNodes, func(n *state.StateNode) (string, *v1.NodePool) {
-		return n.Name(), npByName[n.Labels()[v1.NodePoolLabelKey]]
-	})
-	// Build a set of node names that are marked for deletion so we can exempt their pods
-	// from the consolidateAfter destination check
-	deletingNodeNames := sets.New[string]()
-	for n := range cluster.Nodes() {
-		if n.MarkedForDeletion() {
-			deletingNodeNames.Insert(n.Name())
+	if resolved.preparedSchedulerInputs != nil {
+		s.deletingNodeNames = resolved.preparedSchedulerInputs.cloneDeletingNodeNames()
+		s.calculatePreparedExistingNodeClaims(stateNodes, resolved.preparedSchedulerInputs)
+	} else {
+		npByName := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
+			return np.Name, np
+		})
+		nodeToNodePool := lo.SliceToMap(stateNodes, func(n *state.StateNode) (string, *v1.NodePool) {
+			return n.Name(), npByName[n.Labels()[v1.NodePoolLabelKey]]
+		})
+		// Build a set of node names that are marked for deletion so we can exempt their pods
+		// from the consolidateAfter destination check
+		deletingNodeNames := sets.New[string]()
+		for n := range cluster.Nodes() {
+			if n.MarkedForDeletion() {
+				deletingNodeNames.Insert(n.Name())
+			}
 		}
+		s.deletingNodeNames = deletingNodeNames
+		s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, resolved.enforceConsolidateAfter)
 	}
-	s.deletingNodeNames = deletingNodeNames
-	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, resolved.enforceConsolidateAfter)
 	if resolved.batchLedger != nil {
 		resolved.batchLedger.seedScheduler(s)
 	}
@@ -903,6 +930,30 @@ func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes 
 		daemons := s.getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
 		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Name()], node.NodeClaim, s.clock)
 		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...), s.instanceTypeForNode(node), isUnderConsolidateAfter))
+	}
+	s.sortExistingNodes()
+}
+
+func (s *Scheduler) calculatePreparedExistingNodeClaims(stateNodes []*state.StateNode, prepared *PreparedSchedulerInputs) {
+	for _, node := range stateNodes {
+		s.updateRemainingResources(node)
+		if s.replacementOnly {
+			continue
+		}
+		input, ok := prepared.existingNodes[node.Name()]
+		if !ok {
+			// A prepared session is tied to one node snapshot. Missing input is a
+			// developer error; skip the node rather than rebuilding partial state.
+			continue
+		}
+		s.existingNodes = append(s.existingNodes, NewExistingNode(
+			node.CopyForScheduling(),
+			s.topology,
+			input.taints,
+			input.daemonResources.DeepCopy(),
+			input.instanceType,
+			input.isUnderConsolidateAfter,
+		))
 	}
 	s.sortExistingNodes()
 }

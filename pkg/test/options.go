@@ -67,6 +67,7 @@ type FeatureGates struct {
 	NodePoolDriftBackoff      *bool
 	LaunchBackoff             *bool
 	DriftReplacementBatching  *bool
+	DisruptionSimulationReuse *bool
 }
 
 func Options(overrides ...OptionsFields) *options.Options {
@@ -112,6 +113,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 			NodePoolDriftBackoff:      lo.FromPtrOr(opts.FeatureGates.NodePoolDriftBackoff, options.NodePoolDriftBackoffFeatureGate.Default),
 			LaunchBackoff:             lo.FromPtrOr(opts.FeatureGates.LaunchBackoff, options.LaunchBackoffFeatureGate.Default),
 			DriftReplacementBatching:  lo.FromPtrOr(opts.FeatureGates.DriftReplacementBatching, options.DriftReplacementBatchingFeatureGate.Default),
+			DisruptionSimulationReuse: lo.FromPtrOr(opts.FeatureGates.DisruptionSimulationReuse, options.DisruptionSimulationReuseFeatureGate.Default),
 		},
 	}
 }

@@ -73,6 +73,7 @@ type FeatureGates struct {
 	NodePoolDriftBackoff      bool
 	LaunchBackoff             bool
 	DriftReplacementBatching  bool
+	DisruptionSimulationReuse bool
 }
 
 // FeatureGate is the source-of-truth description of a feature gate. Declaring gates as FeatureGates keeps each gate's
@@ -173,6 +174,13 @@ var (
 		Help: "Karpenter batches dynamic drift replacements, emitting up to 100 safe single-node commands per drift " +
 			"pass within disruption budgets instead of at most one command per reconciliation.",
 	}
+	DisruptionSimulationReuseFeatureGate = FeatureGate{
+		Name:    "DisruptionSimulationReuse",
+		Default: false,
+		Stage:   docs.Alpha,
+		Help: "Karpenter reuses immutable scheduler preparation (topology, node inputs, daemonset overhead) across " +
+			"consolidation simulations in one disruption method pass instead of rebuilding it for each simulation.",
+	}
 )
 
 // KarpenterFeatureGates are the feature gates Karpenter supports, in the order --feature-gates lists them.
@@ -189,6 +197,7 @@ var KarpenterFeatureGates = []FeatureGate{
 	NodePoolDriftBackoffFeatureGate,
 	LaunchBackoffFeatureGate,
 	DriftReplacementBatchingFeatureGate,
+	DisruptionSimulationReuseFeatureGate,
 }
 
 // Options contains all CLI flags / env vars for karpenter-core. It adheres to the options.Injectable interface.
@@ -318,6 +327,7 @@ func DefaultFeatureGates() FeatureGates {
 		NodePoolDriftBackoff:      NodePoolDriftBackoffFeatureGate.Default,
 		LaunchBackoff:             LaunchBackoffFeatureGate.Default,
 		DriftReplacementBatching:  DriftReplacementBatchingFeatureGate.Default,
+		DisruptionSimulationReuse: DisruptionSimulationReuseFeatureGate.Default,
 	}
 }
 
@@ -365,6 +375,9 @@ func ParseFeatureGates(gateStr string) (FeatureGates, error) {
 	}
 	if val, ok := gateMap[DriftReplacementBatchingFeatureGate.Name]; ok {
 		gates.DriftReplacementBatching = val
+	}
+	if val, ok := gateMap[DisruptionSimulationReuseFeatureGate.Name]; ok {
+		gates.DisruptionSimulationReuse = val
 	}
 
 	return gates, nil
