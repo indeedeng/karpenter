@@ -121,14 +121,15 @@ var _ = Describe("Options", func() {
 				PreferencePolicy:                 lo.ToPtr(options.PreferencePolicyRespect),
 				MinValuesPolicy:                  lo.ToPtr(options.MinValuesPolicyStrict),
 				FeatureGates: test.FeatureGates{
-					ReservedCapacity:         new(true),
-					NodeRepair:               new(false),
-					SpotToSpotConsolidation:  new(false),
-					NodeOverlay:              new(false),
-					StaticCapacity:           new(false),
-					CapacityBuffer:           new(false),
-					NodePoolDriftBackoff:     new(true),
-					DriftReplacementBatching: new(true),
+					ReservedCapacity:          new(true),
+					NodeRepair:                new(false),
+					SpotToSpotConsolidation:   new(false),
+					NodeOverlay:               new(false),
+					StaticCapacity:            new(false),
+					CapacityBuffer:            new(false),
+					NodePoolDriftBackoff:      new(true),
+					DriftReplacementBatching:  new(true),
+					DisruptionSimulationReuse: new(false),
 				},
 				IgnoreDRARequests: new(true),
 			}))
@@ -348,6 +349,7 @@ var _ = Describe("Options", func() {
 			Entry("when NodePoolDriftBackoff is overridden", "NodePoolDriftBackoff"),
 			Entry("when LaunchBackoff is overridden", "LaunchBackoff"),
 			Entry("when DriftReplacementBatching is overridden", "DriftReplacementBatching"),
+			Entry("when DisruptionSimulationReuse is overridden", "DisruptionSimulationReuse"),
 		)
 	})
 
@@ -422,5 +424,6 @@ func expectOptionsMatch(optsA, optsB *options.Options) {
 	Expect(optsA.FeatureGates.SpotToSpotConsolidation).To(Equal(optsB.FeatureGates.SpotToSpotConsolidation))
 	Expect(optsA.FeatureGates.NodePoolDriftBackoff).To(Equal(optsB.FeatureGates.NodePoolDriftBackoff))
 	Expect(optsA.FeatureGates.LaunchBackoff).To(Equal(optsB.FeatureGates.LaunchBackoff))
+	Expect(optsA.FeatureGates.DisruptionSimulationReuse).To(Equal(optsB.FeatureGates.DisruptionSimulationReuse))
 	Expect(optsA.IgnoreDRARequests).To(Equal(optsB.IgnoreDRARequests))
 }
