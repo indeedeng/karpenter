@@ -153,4 +153,7 @@ settings:
     # -- launchBackoff is ALPHA and is disabled by default.
     # Setting this to true will bound retries independently for capacity pools that returned insufficient capacity.
     launchBackoff: false
+    # -- disruptionSimulationReuse is ALPHA and is disabled by default.
+    # Setting this to true reuses immutable scheduler preparation across consolidation simulations in one method pass.
+    disruptionSimulationReuse: false
 

@@ -187,6 +187,9 @@ var _ = AfterEach(func() {
 	disruption.NodepoolDecisionsPerformed.Reset()
 	disruption.CandidateDiscoveryDurationSeconds.Reset()
 	disruption.DriftReplacementSimulationDurationSeconds.Reset()
+	disruption.SimulationSessionDurationSeconds.Reset()
+	disruption.SimulationSessionTotal.Reset()
+	disruption.SimulationSessionSharedInputCount.Reset()
 })
 
 var _ = Describe("Launch Backoff", func() {
@@ -346,6 +349,23 @@ var _ = Describe("Simulate Scheduling", func() {
 		results, err := disruption.SimulateScheduling(ctx, env.Client, cluster, prov, env.Clock, recorder, nil, candidate)
 		Expect(err).To(Succeed())
 		Expect(results.PodErrors[pod]).To(BeNil())
+
+		session, err := prov.NewSimulationSession(ctx, cluster.DeepCopyNodes(), pscheduling.IsConsolidationSimulation)
+		Expect(err).To(Succeed())
+		sessionResults, err := disruption.SimulateSchedulingWithSession(ctx, env.Client, cluster, prov, session, disruption.MultiNodeConsolidationType, env.Clock, recorder, nil, candidate)
+		Expect(err).To(Succeed())
+		Expect(sessionResults.AllNonPendingPodsScheduled()).To(Equal(results.AllNonPendingPodsScheduled()))
+		Expect(sessionResults.PodErrors[pod]).To(BeNil())
+		Expect(sessionResults.NewNodeClaims).To(HaveLen(len(results.NewNodeClaims)))
+		Expect(sessionResults.ExistingNodes).To(HaveLen(len(results.ExistingNodes)))
+
+		// A second fork from the same session must not observe placements or
+		// mutable usage from the first speculative solve.
+		secondResults, err := disruption.SimulateSchedulingWithSession(ctx, env.Client, cluster, prov, session, disruption.MultiNodeConsolidationType, env.Clock, recorder, nil, candidate)
+		Expect(err).To(Succeed())
+		Expect(secondResults.AllNonPendingPodsScheduled()).To(Equal(sessionResults.AllNonPendingPodsScheduled()))
+		Expect(secondResults.NewNodeClaims).To(HaveLen(len(sessionResults.NewNodeClaims)))
+		Expect(secondResults.ExistingNodes).To(HaveLen(len(sessionResults.ExistingNodes)))
 	})
 	It("should allow multiple replace operations to happen successively", func() {
 		numNodes := 10
