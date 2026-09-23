@@ -31,6 +31,33 @@ const (
 	CandidatesIneligible         = "candidates_ineligible"
 	policyLabel                  = "policy"
 	terminateFirstReasonLabel    = "terminate_first_reason"
+	methodLabel                  = "method"
+	stageLabel                   = "stage"
+	outcomeLabel                 = "outcome"
+	kindLabel                    = "kind"
+
+	SimulationSessionStageBuild = "build"
+	SimulationSessionStageFork  = "fork"
+
+	SimulationSessionResultCreated  = "created"
+	SimulationSessionResultFallback = "fallback"
+	SimulationSessionResultStale    = "stale"
+
+	SimulationInputKindTopologyStateNode = "topology_state_node"
+	SimulationInputKindNodePool          = "nodepool"
+	SimulationInputKindNodePoolTemplate  = "nodepool_template"
+	SimulationInputKindInstanceType      = "instance_type"
+	SimulationInputKindDaemonSetPod      = "daemonset_pod"
+	SimulationInputKindTopologyKey       = "topology_key"
+)
+
+var (
+	disruptionDurationBuckets = []float64{
+		0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600,
+	}
+	disruptionCountBuckets = []float64{
+		0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
+	}
 )
 
 var (
@@ -103,6 +130,40 @@ var (
 		Name: policyLabel,
 		Help: "The NodePool consolidation policy in effect for the move.",
 	}
+	SimulationMethod = opmetrics.Label{
+		Name:   methodLabel,
+		Help:   "The consolidation method that owns the simulation session.",
+		Values: []opmetrics.Value{MultiNodeConsolidationType, SingleNodeConsolidationType, EmptyConsolidationType},
+	}
+	SimulationStage = opmetrics.Label{
+		Name: stageLabel,
+		Help: "The simulation session stage.",
+		Values: []opmetrics.Value{
+			{Name: SimulationSessionStageBuild, Help: "Building the pass-scoped immutable scheduler inputs."},
+			{Name: SimulationSessionStageFork, Help: "Forking mutable scheduler state for a single simulation."},
+		},
+	}
+	SimulationOutcome = opmetrics.Label{
+		Name: outcomeLabel,
+		Help: "The result of creating a simulation session.",
+		Values: []opmetrics.Value{
+			{Name: SimulationSessionResultCreated, Help: "The session was created."},
+			{Name: SimulationSessionResultFallback, Help: "The session couldn't be created, so simulations fell back to building scheduler inputs each time."},
+			{Name: SimulationSessionResultStale, Help: "The session's inputs went stale during the pass."},
+		},
+	}
+	SimulationInputKind = opmetrics.Label{
+		Name: kindLabel,
+		Help: "The kind of immutable scheduler input prepared for a simulation session.",
+		Values: []opmetrics.Value{
+			{Name: SimulationInputKindTopologyStateNode, Help: "State nodes tracked for topology."},
+			{Name: SimulationInputKindNodePool, Help: "NodePools."},
+			{Name: SimulationInputKindNodePoolTemplate, Help: "NodeClaim templates built from NodePools."},
+			{Name: SimulationInputKindInstanceType, Help: "Instance types."},
+			{Name: SimulationInputKindDaemonSetPod, Help: "DaemonSet pods."},
+			{Name: SimulationInputKindTopologyKey, Help: "Topology keys."},
+		},
+	}
 	TerminateFirstReasonDim = opmetrics.Label{
 		Name: terminateFirstReasonLabel,
 		Help: "Why the terminate-first command couldn't stage its replacement before terminating the node.",
@@ -129,6 +190,41 @@ func init() {
 }
 
 var (
+	SimulationSessionDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "simulation_session_duration_seconds",
+			Help:      "[ALPHA] Monotonic wall-clock duration in seconds of pass-scoped simulation session build and per-simulation mutable fork stages.",
+			Buckets:   disruptionDurationBuckets,
+		},
+		[]opmetrics.Label{SimulationMethod, SimulationStage},
+		opmetrics.Alpha,
+	)
+	SimulationSessionTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "simulation_session_total",
+			Help:      "[ALPHA] Number of pass-scoped simulation sessions by bounded creation, stale, or legacy-fallback result.",
+		},
+		[]opmetrics.Label{SimulationMethod, SimulationOutcome},
+		opmetrics.Alpha,
+	)
+	SimulationSessionSharedInputCount = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "simulation_session_shared_input_count",
+			Help:      "[ALPHA] Count of immutable scheduler inputs prepared once for a pass-scoped simulation session, split by bounded kind.",
+			Buckets:   disruptionCountBuckets,
+		},
+		[]opmetrics.Label{SimulationMethod, SimulationInputKind},
+		opmetrics.Alpha,
+	)
 	EvaluationDurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,
 		prometheus.HistogramOpts{
