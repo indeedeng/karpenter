@@ -54,8 +54,14 @@ const (
 	CandidateStageEligible       = "eligible"
 	CandidateStageBudgetEligible = "budget_eligible"
 
-	SimulationStageEvaluation = "evaluation"
-	SimulationStageValidation = "validation"
+	SimulationStageEvaluation   = "evaluation"
+	SimulationStageValidation   = "validation"
+	SimulationSessionStageBuild = "build"
+	SimulationSessionStageFork  = "fork"
+
+	SimulationSessionResultCreated  = "created"
+	SimulationSessionResultFallback = "fallback"
+	SimulationSessionResultStale    = "stale"
 
 	ValidationStageDelay                  = "delay"
 	ValidationStageCandidateRefreshBefore = "candidate_refresh_before"
@@ -144,6 +150,7 @@ const (
 	SimulationInputKindDaemonSetPod          = "daemonset_pod"
 	SimulationInputKindAdditionalExcludedPod = "additional_excluded_pod"
 	SimulationInputKindPriorRemovedCandidate = "prior_removed_candidate"
+	SimulationInputKindTopologyKey           = "topology_key"
 
 	SimulationResultKindNewNodeClaim      = "new_nodeclaim"
 	SimulationResultKindExistingNode      = "existing_node"
@@ -368,6 +375,38 @@ var (
 			Subsystem: voluntaryDisruptionSubsystem,
 			Name:      "simulation_result_count",
 			Help:      "[ALPHA] Count of scheduling simulation results by bounded kind.",
+			Buckets:   disruptionCountBuckets,
+		},
+		[]string{methodLabel, kindLabel},
+	)
+	SimulationSessionDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "simulation_session_duration_seconds",
+			Help:      "[ALPHA] Monotonic wall-clock duration in seconds of pass-scoped simulation session build and per-simulation mutable fork stages.",
+			Buckets:   disruptionDurationBuckets,
+		},
+		[]string{methodLabel, stageLabel},
+	)
+	SimulationSessionTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "simulation_session_total",
+			Help:      "[ALPHA] Number of pass-scoped simulation sessions by bounded creation, stale, or legacy-fallback result.",
+		},
+		[]string{methodLabel, outcomeLabel},
+	)
+	SimulationSessionSharedInputCount = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "simulation_session_shared_input_count",
+			Help:      "[ALPHA] Count of immutable scheduler inputs prepared once for a pass-scoped simulation session, split by bounded kind.",
 			Buckets:   disruptionCountBuckets,
 		},
 		[]string{methodLabel, kindLabel},

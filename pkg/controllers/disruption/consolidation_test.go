@@ -433,6 +433,12 @@ var _ = Describe("Consolidation", func() {
 			Expect(numNodes).To(Equal(numNodes))
 		})
 		It("should only allow 3 nodes to be deleted in multi node consolidation delete", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+				FeatureGates: test.FeatureGates{
+					SpotToSpotConsolidation:   new(true),
+					DisruptionSimulationReuse: new(true),
+				},
+			}))
 			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "30%"}}
 
 			ExpectApplied(ctx, env.Client, nodePool)
@@ -468,6 +474,21 @@ var _ = Describe("Consolidation", func() {
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 			ExpectSingletonReconciled(ctx, disruptionController)
+			ExpectMetricCounterValue(disruption.SimulationSessionTotal, 1, map[string]string{
+				"method":  disruption.MethodMulti,
+				"outcome": disruption.SimulationSessionResultCreated,
+			})
+			ExpectMetricHistogramSampleCountValue(
+				"karpenter_voluntary_disruption_simulation_session_duration_seconds",
+				1,
+				map[string]string{"method": disruption.MethodMulti, "stage": disruption.SimulationSessionStageBuild},
+			)
+			forkMetric, found := FindMetricWithLabelValues(
+				"karpenter_voluntary_disruption_simulation_session_duration_seconds",
+				map[string]string{"method": disruption.MethodMulti, "stage": disruption.SimulationSessionStageFork},
+			)
+			Expect(found).To(BeTrue())
+			Expect(forkMetric.GetHistogram().GetSampleCount()).To(BeNumerically(">", 0))
 
 			// Execute command, thus deleting 3 nodes
 			cmds := queue.GetCommands()

@@ -56,6 +56,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 		passObservationFromContext(ctx).MarkUnchanged()
 		return []Command{}, nil
 	}
+	defer m.beginSimulationSession(ctx, m.Name())()
 	candidates = m.sortCandidates(ctx, candidates)
 
 	nodePoolsByArch := make(map[string]map[string]int)

@@ -28,6 +28,8 @@ Labels contain no node, pod, namespace, instance type, zone, object ID, raw erro
 - `method`: `empty`, `drift`, `static_drift`, `single`, `multi`.
 - candidate `stage`: `possible`, `eligible`, `budget_eligible`.
 - simulation `stage`: `evaluation`, `validation`.
+- simulation-session `stage`: `build`, `fork`.
+- simulation-session `outcome`: `created`, `stale`, `fallback`.
 - validation `stage`: `delay`, `candidate_refresh_before`, `simulation`, `candidate_refresh_after`, `total`.
 - pass `outcome`: `no_candidates`, `no_command`, `unchanged`, `budget_blocked`, `validation_failed`, `selected`, `partial_selected`, `queue_rejected`, `timeout`, `error`.
 - simulation `outcome`: `schedulable`, `unschedulable`, `candidate_deleting`, `timeout`, `error`.
@@ -40,7 +42,7 @@ Labels contain no node, pod, namespace, instance type, zone, object ID, raw erro
 - timeout `kind`: `eligible`, `evaluated`, `unevaluated`.
 - topology `kind`: `spread`, `affinity`, `anti_affinity`, `inverse_anti_affinity`.
 - work `operation`: `pod_attempt`, `preference_relaxation`, `existing_node_check`, `inflight_nodeclaim_check`, `nodepool_template_check`, `topology_match_check`, `topology_api_read`.
-- input `kind`: `pod`, `topology_state_node`, `accounting_state_node`, `nodepool`, `nodepool_template`, `instance_type`, `daemonset_pod`, `additional_excluded_pod`, `prior_removed_candidate`.
+- input `kind`: `pod`, `topology_state_node`, `accounting_state_node`, `nodepool`, `nodepool_template`, `instance_type`, `daemonset_pod`, `additional_excluded_pod`, `prior_removed_candidate`, `topology_key`.
 - result `kind`: `new_nodeclaim`, `existing_node`, `pod_on_new_nodeclaim`, `pod_on_existing_node`, `pod_error`.
 
 NodePool is allowed only on counters and current-state gauges where the observation has meaningful ownership. A shared multi-pool observation uses `<multiple>` and an observation with no NodePool uses `<none>`. Histograms never have a NodePool label.
@@ -96,6 +98,12 @@ NodePool is allowed only on counters and current-state gauges where the observat
 `simulation_work_count{method,operation}` records exact local work counters once after a simulation. Collection may use local atomics in parallel loops, but Prometheus is updated only after the simulation.
 
 `simulation_result_count{method,kind}` records scheduling result sizes, including existing-node results, new NodeClaims, pods placed on each destination type, and pod errors.
+
+`simulation_session_duration_seconds{method,stage}` records pass-scoped immutable session build duration and the mutable scheduler fork duration paid by each simulation.
+
+`simulation_session_total{method,outcome}` counts sessions successfully created, rejected as stale, or abandoned in favor of the legacy construction path.
+
+`simulation_session_shared_input_count{method,kind}` records the immutable nodes, NodePools, templates, instance types, DaemonSet pods, and topology keys prepared once for a method pass.
 
 ### Consolidation opportunity
 

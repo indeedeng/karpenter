@@ -56,6 +56,19 @@ var errCandidateDeleting = fmt.Errorf("candidate is deleting")
 func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
 	schedulerOpts []scheduling.Options, candidates ...*Candidate,
 ) (results scheduling.Results, err error) {
+	return simulateScheduling(ctx, kubeClient, cluster, provisioner, nil, clk, recorder, schedulerOpts, candidates...)
+}
+
+func SimulateSchedulingWithSession(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, session *provisioning.SimulationSession, clk clock.Clock, recorder events.Recorder,
+	schedulerOpts []scheduling.Options, candidates ...*Candidate,
+) (results scheduling.Results, err error) {
+	return simulateScheduling(ctx, kubeClient, cluster, provisioner, session, clk, recorder, schedulerOpts, candidates...)
+}
+
+//nolint:gocyclo
+func simulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, session *provisioning.SimulationSession, clk clock.Clock, recorder events.Recorder,
+	schedulerOpts []scheduling.Options, candidates ...*Candidate,
+) (results scheduling.Results, err error) {
 	observation := passObservationFromContext(ctx)
 	stage := simulationStageFromContext(ctx)
 	if observation != nil {
@@ -86,7 +99,17 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		}()
 	}
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
-	nodes := cluster.DeepCopyNodes()
+	var nodes state.StateNodes
+	if session == nil {
+		nodes = cluster.DeepCopyNodes()
+	} else {
+		nodes = session.Nodes()
+		for _, candidate := range candidates {
+			if !cluster.IsNodeActive(candidate.ProviderID()) {
+				return scheduling.Results{}, errCandidateDeleting
+			}
+		}
+	}
 	deletingNodes := nodes.Deleting()
 	stateNodes := lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
 		return !candidateNames.Has(n.Name())
@@ -152,13 +175,31 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	// Both consolidation candidate pods and pods on already-deleting nodes are migrating off their current nodes, so
 	// the DRA allocator should treat the devices they hold as available for reallocation (and re-allocate their claims).
 	deletingPodUIDs := sets.New(lo.Map(append(candidatePods, deletingNodePods...), func(p *corev1.Pod, _ int) types.UID { return p.UID })...)
-	scheduler, err := provisioner.NewScheduler(
-		log.IntoContext(ctx, operatorlogging.NopLogger),
-		pods,
-		stateNodes,
-		deletingPodUIDs,
-		opts...,
-	)
+	var scheduler *scheduling.Scheduler
+	if session == nil {
+		scheduler, err = provisioner.NewScheduler(
+			log.IntoContext(ctx, operatorlogging.NopLogger),
+			pods,
+			stateNodes,
+			deletingPodUIDs,
+			opts...,
+		)
+	} else {
+		forkStarted := time.Now()
+		scheduler, err = session.NewScheduler(
+			log.IntoContext(ctx, operatorlogging.NopLogger),
+			pods,
+			stateNodes,
+			deletingPodUIDs,
+			opts...,
+		)
+		if observation != nil {
+			SimulationSessionDurationSeconds.Observe(time.Since(forkStarted).Seconds(), map[string]string{
+				methodLabel: observation.method.Name(),
+				stageLabel:  SimulationSessionStageFork,
+			})
+		}
+	}
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("creating scheduler, %w", err)
 	}
@@ -170,6 +211,13 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	results, err = scheduler.Solve(log.IntoContext(ctx, operatorlogging.NopLogger), pods)
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("scheduling pods, %w", err)
+	}
+	if session != nil {
+		for _, candidate := range candidates {
+			if !cluster.IsNodeActive(candidate.ProviderID()) {
+				return scheduling.Results{}, errCandidateDeleting
+			}
+		}
 	}
 	results = results.TruncateInstanceTypes(ctx, scheduling.MaxInstanceTypes)
 	for _, n := range results.ExistingNodes {

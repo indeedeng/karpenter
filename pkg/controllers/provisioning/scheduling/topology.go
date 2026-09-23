@@ -91,12 +91,18 @@ func NewTopology(
 		}
 		resolvedOptions.simulationReport.instanceTypes.Store(instanceTypeCount)
 	}
+	var domainGroups map[string]TopologyDomainGroup
+	if resolvedOptions.preparedSchedulerInputs == nil {
+		domainGroups = buildDomainGroups(nodePools, instanceTypes)
+	} else {
+		domainGroups = resolvedOptions.preparedSchedulerInputs.domainGroups
+	}
 	t := &Topology{
 		kubeClient:            kubeClient,
 		preferencePolicy:      resolvedOptions.preferencePolicy,
 		cluster:               cluster,
 		stateNodes:            stateNodes,
-		domainGroups:          buildDomainGroups(nodePools, instanceTypes),
+		domainGroups:          domainGroups,
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[uint64]*TopologyGroup{},
 		excludedPods:          sets.New[string](),
