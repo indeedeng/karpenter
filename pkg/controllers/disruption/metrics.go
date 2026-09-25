@@ -35,6 +35,26 @@ const (
 	outcomeLabel                 = "outcome"
 	kindLabel                    = "kind"
 
+	// FailureReasonLabel records why a disruption command was discarded during validation.
+	FailureReasonLabel = "failure_reason"
+
+	// A candidate was no longer a valid disruption candidate when re-checked.
+	ValidationFailureReasonChurn = "churn"
+	// A pod was nominated to schedule onto a candidate.
+	ValidationFailureReasonNominated = "nominated"
+	// Disrupting a candidate would no longer fit within its NodePool's disruption budget.
+	ValidationFailureReasonBudget = "budget"
+	// The re-run scheduling simulation could not place all of the candidates' pods.
+	ValidationFailureReasonUnschedulable = "unschedulable"
+	// The command expected a replacement, but the re-run scheduling simulation placed all pods on existing capacity.
+	ValidationFailureReasonNoNewNodeClaim = "no_new_nodeclaim"
+	// The re-run scheduling simulation required more than one new NodeClaim.
+	ValidationFailureReasonMultipleNodeClaims = "multiple_nodeclaims"
+	// The command expected no replacement, but the re-run scheduling simulation required a new NodeClaim.
+	ValidationFailureReasonUnexpectedReplacement = "unexpected_replacement"
+	// The command's replacement instance types were no longer a subset of those the re-run scheduling simulation allows.
+	ValidationFailureReasonInstanceTypesNotSubset = "instance_types_not_subset"
+
 	SimulationSessionStageBuild = "build"
 	SimulationSessionStageFork  = "fork"
 
@@ -176,9 +196,9 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: voluntaryDisruptionSubsystem,
 			Name:      "failed_validations_total",
-			Help:      "Number of candidates that were selected for disruption but failed validation. Labeled by consolidation type.",
+			Help:      "Number of candidates that were selected for disruption but failed validation. Labeled by consolidation type and failure reason.",
 		},
-		[]string{ConsolidationTypeLabel},
+		[]string{ConsolidationTypeLabel, FailureReasonLabel},
 	)
 	NodePoolAllowedDisruptions = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
