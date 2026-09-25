@@ -125,16 +125,17 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 				m.evaluator.EmitMultiNodeEvents(ctx, cmd, perPoolResults, true)
 			}
 
-			if cmd, err = m.validator.Validate(ctx, cmd, commandValidationDelay); err != nil {
+			validCmd, err := m.validator.Validate(ctx, cmd, commandValidationDelay)
+			if err != nil {
 				if IsValidationError(err) {
-					reason := getValidationFailureReason(err)
-					cmd.EmitRejectedEvents(m.recorder, reason)
+					log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).Info("abandoning multi-node consolidation attempt, command failed validation", "failure_reason", validationFailureReason(err), "error", err)
+					cmd.EmitRejectedEvents(m.recorder, getValidationFailureReason(err))
 					return []Command{}, nil
 				}
 				return []Command{}, fmt.Errorf("validating consolidation, %w", err)
 			}
-			log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).WithValues("NewNodes", len(cmd.Replacements), "ReplacedNodes", len(cmd.Candidates)).Info("multi-node consolidation cmd success")
-			return []Command{cmd}, nil
+			log.FromContext(ctx).V(1).WithValues(validCmd.LogValues()...).WithValues("NewNodes", len(validCmd.Replacements), "ReplacedNodes", len(validCmd.Candidates)).Info("multi-node consolidation cmd success")
+			return []Command{validCmd}, nil
 		}
 	}
 
