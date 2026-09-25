@@ -113,13 +113,14 @@ func (t *TestEmptinessValidator) Validate(ctx context.Context, cmd disruption.Co
 }
 
 type TestConsolidationValidator struct {
-	blocked       bool
-	churn         bool
-	nominated     bool
-	pendingPods   []*corev1.Pod
-	cluster       *state.Cluster
-	nodePool      *v1.NodePool
-	consolidation *disruption.ConsolidationValidator
+	blocked        bool
+	churn          bool
+	nominated      bool
+	pendingPods    []*corev1.Pod
+	beforeValidate func()
+	cluster        *state.Cluster
+	nodePool       *v1.NodePool
+	consolidation  *disruption.ConsolidationValidator
 }
 
 type TestConsolidationValidatorOption func(*TestConsolidationValidator)
@@ -147,6 +148,14 @@ func WithUnderutilizedNodeNomination() TestConsolidationValidatorOption {
 func WithPendingPodChurn(pods ...*corev1.Pod) TestConsolidationValidatorOption {
 	return func(v *TestConsolidationValidator) {
 		v.pendingPods = pods
+	}
+}
+
+// WithClusterChangeBeforeValidation runs f after the command is computed and before it is validated, simulating a
+// cluster change during the validation delay.
+func WithClusterChangeBeforeValidation(f func()) TestConsolidationValidatorOption {
+	return func(v *TestConsolidationValidator) {
+		v.beforeValidate = f
 	}
 }
 
@@ -189,6 +198,9 @@ func (t *TestConsolidationValidator) Validate(ctx context.Context, cmd disruptio
 	}
 	for _, pod := range t.pendingPods {
 		ExpectApplied(ctx, env.Client, pod)
+	}
+	if t.beforeValidate != nil {
+		t.beforeValidate()
 	}
 	return t.consolidation.Validate(ctx, cmd, 0)
 }

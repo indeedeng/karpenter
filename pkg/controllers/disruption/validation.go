@@ -46,10 +46,30 @@ var ValidationIgnoresPodChurn = env.WithDefaultBool("INDEED_CONSOLIDATION_VALIDA
 
 type ValidationError struct {
 	error
+	failureReason string
 }
 
 func NewValidationError(err error) *ValidationError {
 	return &ValidationError{error: err}
+}
+
+func (e *ValidationError) setFailureReason(reason string) {
+	e.failureReason = reason
+}
+
+// withFailureReason tags a validation error with the bounded ValidationFailureReason it is reported under.
+func withFailureReason[E interface{ setFailureReason(string) }](err E, reason string) E {
+	err.setFailureReason(reason)
+	return err
+}
+
+// validationFailureReason returns the ValidationFailureReason a validation error was tagged with, or "" if it has none.
+func validationFailureReason(err error) string {
+	var validationError *ValidationError
+	if errors.As(err, &validationError) {
+		return validationError.failureReason
+	}
+	return ""
 }
 
 func IsValidationError(err error) bool {
@@ -219,6 +239,9 @@ func (c *ConsolidationValidator) isValid(ctx context.Context, cmd Command, valid
 		return err
 	}
 	if err := c.validateCommand(ctx, cmd, validatedCandidates); err != nil {
+		if IsValidationError(err) {
+			FailedValidationsTotal.Add(float64(len(cmd.Candidates)), map[string]string{ConsolidationTypeLabel: c.validationType, FailureReasonLabel: validationFailureReason(err)})
+		}
 		return err
 	}
 	// Revalidate candidates after validating the command. This mitigates the chance of a race condition outlined in
@@ -237,21 +260,24 @@ func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates 
 	}
 	validatedCandidates = mapCandidates(candidates, validatedCandidates)
 	if len(validatedCandidates) == 0 {
-		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: e.validationType})
-		return nil, NewChurnValidationError(fmt.Errorf("%d candidates are no longer valid", len(candidates)))
+		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: e.validationType, FailureReasonLabel: ValidationFailureReasonChurn})
+		return nil, withFailureReason(NewChurnValidationError(fmt.Errorf("%d candidates are no longer valid", len(candidates))), ValidationFailureReasonChurn)
 	}
 	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, e.cluster, e.clock, e.kubeClient, e.cloudProvider, e.recorder, e.reason)
 	if err != nil {
 		return nil, fmt.Errorf("building disruption budgets, %w", err)
 	}
 
+	var failureReason string
 	if valid := lo.Filter(validatedCandidates, func(cn *Candidate, _ int) bool {
 		if e.cluster.IsNodeNominated(cn.ProviderID()) {
-			FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: e.validationType})
+			FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: e.validationType, FailureReasonLabel: ValidationFailureReasonNominated})
+			failureReason = ValidationFailureReasonNominated
 			return false
 		}
 		if disruptionBudgetMapping[cn.NodePool.Name] == 0 {
-			FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: e.validationType})
+			FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: e.validationType, FailureReasonLabel: ValidationFailureReasonBudget})
+			failureReason = ValidationFailureReasonBudget
 			return false
 		}
 		disruptionBudgetMapping[cn.NodePool.Name]--
@@ -259,7 +285,7 @@ func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates 
 	}); len(valid) > 0 {
 		return valid, nil
 	}
-	return nil, NewBudgetValidationError(fmt.Errorf("%d candidates failed validation because it they were nominated for a pod or would violate disruption budgets", len(candidates)))
+	return nil, withFailureReason(NewBudgetValidationError(fmt.Errorf("%d candidates failed validation because it they were nominated for a pod or would violate disruption budgets", len(candidates))), failureReason)
 }
 
 // ValidateCandidates gets the current representation of the provided candidates and ensures that they are all still valid.
@@ -279,8 +305,8 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 	validatedCandidates = mapCandidates(candidates, validatedCandidates)
 	// If we filtered out any candidates, return nil as some NodeClaims in the consolidation decision have changed.
 	if len(validatedCandidates) != len(candidates) {
-		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
-		return nil, NewChurnValidationError(fmt.Errorf("%d candidates are no longer valid", len(candidates)-len(validatedCandidates)))
+		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType, FailureReasonLabel: ValidationFailureReasonChurn})
+		return nil, withFailureReason(NewChurnValidationError(fmt.Errorf("%d candidates are no longer valid", len(candidates)-len(validatedCandidates))), ValidationFailureReasonChurn)
 	}
 	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, c.reason)
 	if err != nil {
@@ -291,12 +317,12 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 	//  b. Disrupting the candidate would violate node disruption budgets
 	for _, vc := range validatedCandidates {
 		if c.cluster.IsNodeNominated(vc.ProviderID()) {
-			FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
-			return nil, NewBudgetValidationError(fmt.Errorf("a candidate was nominated during validation"))
+			FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType, FailureReasonLabel: ValidationFailureReasonNominated})
+			return nil, withFailureReason(NewBudgetValidationError(fmt.Errorf("a candidate was nominated during validation")), ValidationFailureReasonNominated)
 		}
 		if disruptionBudgetMapping[vc.NodePool.Name] == 0 {
-			FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
-			return nil, NewBudgetValidationError(fmt.Errorf("a candidate can no longer be disrupted without violating budgets"))
+			FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType, FailureReasonLabel: ValidationFailureReasonBudget})
+			return nil, withFailureReason(NewBudgetValidationError(fmt.Errorf("a candidate can no longer be disrupted without violating budgets")), ValidationFailureReasonBudget)
 		}
 		disruptionBudgetMapping[vc.NodePool.Name]--
 	}
@@ -307,14 +333,14 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 func (v *validation) validateCommand(ctx context.Context, cmd Command, candidates []*Candidate) error {
 	// None of the chosen candidate are valid for execution, so retry
 	if len(candidates) == 0 {
-		return NewValidationError(fmt.Errorf("no candidates"))
+		return withFailureReason(NewValidationError(fmt.Errorf("no candidates")), ValidationFailureReasonChurn)
 	}
 	results, err := SimulateScheduling(ctx, v.kubeClient, v.cluster, v.provisioner, v.clock, v.recorder, []scheduling.Options{scheduling.IsConsolidationSimulation}, candidates...)
 	if err != nil {
 		return fmt.Errorf("simluating scheduling, %w", err)
 	}
 	if !results.AllNonPendingPodsScheduled() {
-		return NewSchedulingValidationError(errors.New(results.NonPendingPodSchedulingErrors()))
+		return withFailureReason(NewSchedulingValidationError(errors.New(results.NonPendingPodSchedulingErrors())), ValidationFailureReasonUnschedulable)
 	}
 
 	newNodeClaims := results.NewNodeClaims
@@ -338,18 +364,18 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 		}
 		// if it produced no new NodeClaims, but we were expecting one we should re-simulate as there is likely a better
 		// consolidation option now
-		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results: no new node claims"))
+		return withFailureReason(NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results, expected a replacement but pods fit on existing capacity")), ValidationFailureReasonNoNewNodeClaim)
 	}
 
 	// we need more than one replacement node which is never valid currently (all of our node replacement is m->1, never m->n)
 	if len(newNodeClaims) > 1 {
-		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results: more than one new node claim"))
+		return withFailureReason(NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results, %d new nodeclaims are required", len(newNodeClaims))), ValidationFailureReasonMultipleNodeClaims)
 	}
 
 	// we now know that scheduling simulation wants to create one new node
 	if len(cmd.Replacements) == 0 {
 		// but we weren't expecting any new NodeClaims, so this is invalid
-		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results: no replacements expected"))
+		return withFailureReason(NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results, a new nodeclaim is required but no replacement was expected")), ValidationFailureReasonUnexpectedReplacement)
 	}
 
 	// We know that the scheduling simulation wants to create a new node and that the command we are verifying wants
@@ -364,7 +390,7 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	// now says that we need to launch a 4xlarge. It's still launching the correct number of NodeClaims, but it's just
 	// as expensive or possibly more so we shouldn't validate.
 	if !instanceTypesAreSubset(cmd.Replacements[0].InstanceTypeOptions, newNodeClaims[0].InstanceTypeOptions) {
-		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results: instance types not in subset"))
+		return withFailureReason(NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results, replacement instance types are no longer a subset of the compatible instance types")), ValidationFailureReasonInstanceTypesNotSubset)
 	}
 
 	// Now we know:
