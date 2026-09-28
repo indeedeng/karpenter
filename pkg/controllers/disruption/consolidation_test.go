@@ -334,6 +334,78 @@ var _ = Describe("Consolidation", func() {
 			Entry("when candidates are filtered out due to pod churn", WithUnderutilizedChurn()),
 			Entry("when candidates are filtered out due to candidate being nominated", WithUnderutilizedNodeNomination()),
 		)
+		DescribeTable("should handle unrelated pods that become pending during validation", func(ignorePodChurn bool, expectedCommands int) {
+			previous := disruption.ValidationIgnoresPodChurn
+			disruption.ValidationIgnoresPodChurn = ignorePodChurn
+			DeferCleanup(func() { disruption.ValidationIgnoresPodChurn = previous })
+
+			otherNodePool := test.NodePool(v1.NodePool{
+				Spec: v1.NodePoolSpec{
+					Template: v1.NodeClaimTemplate{
+						Spec: v1.NodeClaimTemplateSpec{
+							Taints: []corev1.Taint{{Key: "pending-churn", Effect: corev1.TaintEffectNoSchedule}},
+						},
+					},
+				},
+			})
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+			pods := test.Pods(2, test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "ReplicaSet",
+							Name:               rs.Name,
+							UID:                rs.UID,
+							Controller:         new(true),
+							BlockOwnerDeletion: new(true),
+						},
+					}}})
+			nodeClaim2, node2 := test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        mostExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32")},
+				},
+			})
+			nodeClaim2.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+			ExpectApplied(ctx, env.Client, rs, pods[0], pods[1], node, node2, nodeClaim, nodeClaim2, nodePool, otherNodePool)
+			ExpectManualBinding(ctx, env.Client, pods[0], node)
+			ExpectManualBinding(ctx, env.Client, pods[1], node2)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node, node2}, []*v1.NodeClaim{nodeClaim, nodeClaim2})
+
+			// The pending pod can only land on otherNodePool, whose taint keeps candidate pods off that NodeClaim.
+			pendingPod := test.UnschedulablePod(test.PodOptions{
+				NodeSelector: map[string]string{v1.NodePoolLabelKey: otherNodePool.Name},
+				Tolerations:  []corev1.Toleration{{Key: "pending-churn", Operator: corev1.TolerationOpExists}},
+			})
+			c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)
+			singleNodeConsolidation := disruption.NewSingleNodeConsolidation(c, disruption.WithValidator(NewTestSingleConsolidationValidator(nodePool, WithPendingPodChurn(pendingPod))))
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, singleNodeConsolidation.Reason())
+			Expect(err).To(Succeed())
+
+			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, singleNodeConsolidation.ShouldDisrupt, singleNodeConsolidation.Class(), queue)
+			Expect(err).To(Succeed())
+
+			cmds, err := singleNodeConsolidation.ComputeCommands(ctx, budgets, candidates...)
+			Expect(err).To(Succeed())
+			Expect(cmds).To(HaveLen(expectedCommands))
+			if expectedCommands > 0 {
+				Expect(cmds[0].Replacements).To(HaveLen(1))
+				Expect(cmds[0].Replacements[0].NodePoolName).To(Equal(nodePool.Name))
+			}
+		},
+			Entry("rejects the command by default", false, 0),
+			Entry("keeps the command when pod churn is ignored", true, 1),
+		)
 	})
 	Context("Budgets", func() {
 		var numNodes = 10

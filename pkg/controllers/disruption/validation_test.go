@@ -116,6 +116,7 @@ type TestConsolidationValidator struct {
 	blocked       bool
 	churn         bool
 	nominated     bool
+	pendingPods   []*corev1.Pod
 	cluster       *state.Cluster
 	nodePool      *v1.NodePool
 	consolidation *disruption.ConsolidationValidator
@@ -138,6 +139,14 @@ func WithUnderutilizedBlockingBudget() TestConsolidationValidatorOption {
 func WithUnderutilizedNodeNomination() TestConsolidationValidatorOption {
 	return func(v *TestConsolidationValidator) {
 		v.nominated = true
+	}
+}
+
+// WithPendingPodChurn creates the given pods just before validation, simulating pods that become pending during the
+// validation delay.
+func WithPendingPodChurn(pods ...*corev1.Pod) TestConsolidationValidatorOption {
+	return func(v *TestConsolidationValidator) {
+		v.pendingPods = pods
 	}
 }
 
@@ -177,6 +186,9 @@ func (t *TestConsolidationValidator) Validate(ctx context.Context, cmd disruptio
 	}
 	if t.nominated {
 		nominated(nodes, nodeClaims)
+	}
+	for _, pod := range t.pendingPods {
+		ExpectApplied(ctx, env.Client, pod)
 	}
 	return t.consolidation.Validate(ctx, cmd, 0)
 }
