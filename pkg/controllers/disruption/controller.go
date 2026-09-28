@@ -122,6 +122,7 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 		fmt.Printf("single node consolidation is disabled\n")
 	}
 	fmt.Printf("multi node consolidation timeout duration: %s\n", MultiNodeConsolidationTimeoutDuration)
+	fmt.Printf("consolidation validation ignores pod churn: %t\n", ValidationIgnoresPodChurn)
 	return methods
 }
 
