@@ -23,8 +23,12 @@ import (
 	"time"
 
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -32,7 +36,13 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/utils/env"
 )
+
+// ValidationIgnoresPodChurn makes consolidation validation disregard new NodeClaims that host none of the command's
+// candidate pods. The validation simulation includes every pending pod in the cluster, so pods that become pending
+// during the validation delay otherwise add NodeClaims that invalidate commands they have no relation to.
+var ValidationIgnoresPodChurn = env.WithDefaultBool("INDEED_CONSOLIDATION_VALIDATION_IGNORE_POD_CHURN", false)
 
 type ValidationError struct {
 	error
@@ -307,13 +317,21 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 		return NewSchedulingValidationError(errors.New(results.NonPendingPodSchedulingErrors()))
 	}
 
+	newNodeClaims := results.NewNodeClaims
+	if ValidationIgnoresPodChurn {
+		newNodeClaims = nodeClaimsHostingCandidatePods(results.NewNodeClaims, candidates)
+		if ignored := len(results.NewNodeClaims) - len(newNodeClaims); ignored > 0 {
+			log.FromContext(ctx).V(1).Info("ignoring validation nodeclaims that host no candidate pods", "ignored", ignored, "remaining", len(newNodeClaims))
+		}
+	}
+
 	// We want to ensure that the re-simulated scheduling using the current cluster state produces the same result.
 	// There are three possible options for the number of new candidates that we need to handle:
 	// len(NewNodeClaims) == 0, as long as we weren't expecting a new node, this is valid
 	// len(NewNodeClaims) > 1, something in the cluster changed so that the candidates we were going to delete can no longer
 	//                    be deleted without producing more than one node
 	// len(NewNodeClaims) == 1, as long as the noe looks like what we were expecting, this is valid
-	if len(results.NewNodeClaims) == 0 {
+	if len(newNodeClaims) == 0 {
 		if len(cmd.Replacements) == 0 {
 			// scheduling produced zero new NodeClaims and we weren't expecting any, so this is valid.
 			return nil
@@ -324,7 +342,7 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	}
 
 	// we need more than one replacement node which is never valid currently (all of our node replacement is m->1, never m->n)
-	if len(results.NewNodeClaims) > 1 {
+	if len(newNodeClaims) > 1 {
 		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results: more than one new node claim"))
 	}
 
@@ -345,7 +363,7 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	// a 4xlarge and replace it with a 2xlarge. If things have changed and the scheduling simulation we just performed
 	// now says that we need to launch a 4xlarge. It's still launching the correct number of NodeClaims, but it's just
 	// as expensive or possibly more so we shouldn't validate.
-	if !instanceTypesAreSubset(cmd.Replacements[0].InstanceTypeOptions, results.NewNodeClaims[0].InstanceTypeOptions) {
+	if !instanceTypesAreSubset(cmd.Replacements[0].InstanceTypeOptions, newNodeClaims[0].InstanceTypeOptions) {
 		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results: instance types not in subset"))
 	}
 
@@ -353,6 +371,18 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	// - current scheduling simulation says to create a new node with types T = {T_0, T_1, ..., T_n}
 	// - our lifecycle command says to create a node with types {U_0, U_1, ..., U_n} where U is a subset of T
 	return nil
+}
+
+func nodeClaimsHostingCandidatePods(nodeClaims []*scheduling.NodeClaim, candidates []*Candidate) []*scheduling.NodeClaim {
+	candidatePods := sets.New[types.UID]()
+	for _, candidate := range candidates {
+		for _, pod := range candidate.reschedulablePods {
+			candidatePods.Insert(pod.UID)
+		}
+	}
+	return lo.Filter(nodeClaims, func(nodeClaim *scheduling.NodeClaim, _ int) bool {
+		return lo.ContainsBy(nodeClaim.Pods, func(pod *corev1.Pod) bool { return candidatePods.Has(pod.UID) })
+	})
 }
 
 // getValidationFailureReason categorizes validation errors into specific failure types
