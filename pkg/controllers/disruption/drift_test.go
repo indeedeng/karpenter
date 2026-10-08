@@ -1303,6 +1303,103 @@ var _ = Describe("Drift", func() {
 		})
 	})
 
+	Context("DaemonSet pods on replacements", func() {
+		agentLabels := map[string]string{"k8s-app": "cilium"}
+		agentOnSameNode := []corev1.PodAffinityTerm{{
+			LabelSelector: &metav1.LabelSelector{MatchLabels: agentLabels},
+			TopologyKey:   corev1.LabelHostname,
+		}}
+		var rs *appsv1.ReplicaSet
+
+		BeforeEach(func() {
+			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+			rs = test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+		})
+		agentDaemonSet := func(podOptions test.PodOptions) *appsv1.DaemonSet {
+			podOptions.Labels = agentLabels
+			daemonSet := test.DaemonSet(test.DaemonSetOptions{PodOptions: podOptions})
+			ExpectApplied(ctx, env.Client, daemonSet)
+			return daemonSet
+		}
+		agentPod := func(daemonSet *appsv1.DaemonSet) *corev1.Pod {
+			return test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{
+				Labels: agentLabels,
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1",
+					Kind:       "DaemonSet",
+					Name:       daemonSet.Name,
+					UID:        daemonSet.UID,
+					Controller: new(true),
+				}},
+			}})
+		}
+		relayPod := func(podOptions test.PodOptions) *corev1.Pod {
+			podOptions.OwnerReferences = []metav1.OwnerReference{{
+				APIVersion:         "apps/v1",
+				Kind:               "ReplicaSet",
+				Name:               rs.Name,
+				UID:                rs.UID,
+				Controller:         new(true),
+				BlockOwnerDeletion: new(true),
+			}}
+			return test.Pod(podOptions)
+		}
+		disruptCandidate := func(pods ...*corev1.Pod) []*disruption.Command {
+			ExpectApplied(ctx, env.Client, nodeClaim, node, nodePool)
+			for _, pod := range pods {
+				ExpectApplied(ctx, env.Client, pod)
+				ExpectManualBinding(ctx, env.Client, pod, node)
+			}
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectSingletonReconciled(ctx, disruptionController)
+			return queue.GetCommands()
+		}
+
+		It("should replace a candidate whose pod requires a DaemonSet pod on its node", func() {
+			daemonSet := agentDaemonSet(test.PodOptions{})
+			cmds := disruptCandidate(agentPod(daemonSet), relayPod(test.PodOptions{PodRequirements: agentOnSameNode}))
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Replacements).To(HaveLen(1))
+		})
+		It("should block the candidate when the DaemonSet does not run on it", func() {
+			agentDaemonSet(test.PodOptions{})
+			cmds := disruptCandidate(relayPod(test.PodOptions{PodRequirements: agentOnSameNode}))
+			Expect(cmds).To(BeEmpty())
+		})
+		It("should block the candidate when the DaemonSet is incompatible with every replacement NodePool", func() {
+			daemonSet := agentDaemonSet(test.PodOptions{NodeSelector: map[string]string{"example.com/cilium": "enabled"}})
+			cmds := disruptCandidate(agentPod(daemonSet), relayPod(test.PodOptions{PodRequirements: agentOnSameNode}))
+			Expect(cmds).To(BeEmpty())
+		})
+		It("should restrict replacement instance types to those that run the DaemonSet", func() {
+			daemonSet := agentDaemonSet(test.PodOptions{NodeRequirements: []corev1.NodeSelectorRequirement{{
+				Key:      corev1.LabelInstanceTypeStable,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{leastExpensiveInstance.Name},
+			}}})
+			cmds := disruptCandidate(agentPod(daemonSet), relayPod(test.PodOptions{PodRequirements: agentOnSameNode}))
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Replacements).To(HaveLen(1))
+			Expect(lo.Map(cmds[0].Replacements[0].InstanceTypeOptions, func(it *cloudprovider.InstanceType, _ int) string { return it.Name })).
+				To(ConsistOf(leastExpensiveInstance.Name))
+		})
+		It("should exclude replacement instance types that run a DaemonSet the pod has anti-affinity to", func() {
+			daemonSet := agentDaemonSet(test.PodOptions{NodeRequirements: []corev1.NodeSelectorRequirement{{
+				Key:      corev1.LabelInstanceTypeStable,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{leastExpensiveInstance.Name},
+			}}})
+			cmds := disruptCandidate(agentPod(daemonSet), relayPod(test.PodOptions{PodAntiRequirements: agentOnSameNode}))
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Replacements).To(HaveLen(1))
+			names := lo.Map(cmds[0].Replacements[0].InstanceTypeOptions, func(it *cloudprovider.InstanceType, _ int) string { return it.Name })
+			Expect(names).ToNot(BeEmpty())
+			Expect(names).ToNot(ContainElement(leastExpensiveInstance.Name))
+		})
+	})
+
 	Context("Static NodePool", func() {
 		It("should not consider static nodepool for drift", func() {
 			staticNp := test.StaticNodePool(v1.NodePool{

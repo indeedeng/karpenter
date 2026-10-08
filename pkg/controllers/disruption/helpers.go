@@ -259,6 +259,7 @@ func (s *driftReplacementSimulator) simulate(ctx context.Context, candidate *Can
 		opts = append(opts, scheduling.IgnorePreferences)
 	}
 	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
+	opts = append(opts, scheduling.WithExpectedDaemonSetPods(s.catalog.DaemonSetPods(candidate.daemonSets)...))
 	scheduler, err := s.provisioner.NewReplacementScheduler(
 		log.IntoContext(ctx, operatorlogging.NopLogger),
 		pods,

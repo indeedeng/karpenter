@@ -101,6 +101,7 @@ type options struct {
 	replacementOnly         bool
 	batchLedger             *BatchLedger
 	additionalExcludedPods  []*corev1.Pod
+	expectedDaemonSetPods   []*corev1.Pod
 	preparedSchedulerInputs *PreparedSchedulerInputs
 }
 
@@ -155,6 +156,15 @@ func WithBatchLedger(ledger *BatchLedger) Options {
 func WithAdditionalExcludedPods(pods ...*corev1.Pod) Options {
 	return func(opts *options) {
 		opts.additionalExcludedPods = pods
+	}
+}
+
+// WithExpectedDaemonSetPods counts the given daemon pods in each new NodeClaim's hostname domain for pod affinity and
+// anti-affinity, on the instance types where the pod is compatible. The pods must come from the daemonSetPods passed to
+// NewScheduler.
+func WithExpectedDaemonSetPods(pods ...*corev1.Pod) Options {
+	return func(opts *options) {
+		opts.expectedDaemonSetPods = pods
 	}
 }
 
@@ -242,6 +252,7 @@ func NewScheduler(
 		topology:                topology,
 		cluster:                 cluster,
 		daemonOverheadGroups:    daemonOverheadGroups,
+		expectedDaemonPods:      buildExpectedDaemonPods(daemonOverheadGroups, resolvedOptions.expectedDaemonSetPods),
 		cachedPodData:           map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
 		volumeReqsByPod:         volumeReqsByPod,          // Volume requirements per pod
 		recorder:                recorder,
@@ -312,6 +323,7 @@ type Scheduler struct {
 	unavailableTemplates    []*NodeClaimTemplate
 	remainingResources      map[string]corev1.ResourceList // (NodePool name) -> remaining resources for that NodePool
 	daemonOverheadGroups    map[*NodeClaimTemplate][]DaemonOverheadGroup
+	expectedDaemonPods      map[*NodeClaimTemplate]*expectedDaemonPods
 	cachedPodData           map[types.UID]*PodData                  // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
 	volumeReqsByPod         map[types.UID][]scheduling.Requirements // Volume topology requirement alternatives per pod
 	preferences             *Preferences
@@ -785,7 +797,7 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 
 func (s *Scheduler) offeringsUnavailableError(ctx context.Context, pod *corev1.Pod) error {
 	for _, template := range s.unavailableTemplates {
-		nodeClaim := NewNodeClaim(template, s.topology, s.daemonOverheadGroups[template], template.InstanceTypeOptions, s.reservationManager, s.reservedOfferingMode)
+		nodeClaim := NewNodeClaim(template, s.topology, s.daemonOverheadGroups[template], s.expectedDaemonPods[template], template.InstanceTypeOptions, s.reservationManager, s.reservedOfferingMode)
 		_, _, _, _, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort, s.allocator)
 		if IsOfferingsUnavailableError(err) {
 			return err
@@ -828,7 +840,7 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 					"total", len(s.nodeClaimTemplates[i].InstanceTypeOptions))
 			}
 		}
-		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverheadGroups[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode)
+		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverheadGroups[s.nodeClaimTemplates[i]], s.expectedDaemonPods[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode)
 		r, its, ofs, result, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort, s.allocator)
 		if err != nil {
 			errs[i] = err
@@ -1094,6 +1106,8 @@ type DaemonOverheadGroup struct {
 	InstanceTypes  []*cloudprovider.InstanceType
 	DaemonOverhead corev1.ResourceList
 	HostPortUsage  *scheduling.HostPortUsage
+	// Pods are the daemon pods compatible with every instance type in the group.
+	Pods []*corev1.Pod
 }
 
 // buildDaemonOverheadGroups groups instance types by their compatible daemon pods and computes the following for NodeClaimTemplate and group
@@ -1125,6 +1139,7 @@ func buildDaemonOverheadGroups(ctx context.Context, nodeClaimTemplates []*NodeCl
 					InstanceTypes:  []*cloudprovider.InstanceType{it},
 					DaemonOverhead: overhead,
 					HostPortUsage:  hostPortUsage,
+					Pods:           compatible,
 				}
 			}
 		}

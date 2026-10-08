@@ -478,6 +478,16 @@ type SchedulerCatalog struct {
 	nodePools     []*v1.NodePool
 	instanceTypes map[string][]*cloudprovider.InstanceType
 	daemonSetPods []*corev1.Pod
+	// daemonSetPodsByDaemonSet indexes daemonSetPods by their DaemonSet.
+	daemonSetPodsByDaemonSet map[types.NamespacedName]*corev1.Pod
+}
+
+// DaemonSetPods returns the catalog's daemon pods for the given DaemonSets, skipping DaemonSets the catalog doesn't know.
+func (c *SchedulerCatalog) DaemonSetPods(daemonSets sets.Set[types.NamespacedName]) []*corev1.Pod {
+	return lo.FilterMap(daemonSets.UnsortedList(), func(key types.NamespacedName, _ int) (*corev1.Pod, bool) {
+		pod, ok := c.daemonSetPodsByDaemonSet[key]
+		return pod, ok
+	})
 }
 
 // NewSchedulerCatalog captures read-only scheduler inputs for reuse within one controller pass.
@@ -529,14 +539,15 @@ func (p *Provisioner) NewSchedulerCatalog(ctx context.Context) (*SchedulerCatalo
 		// cached view.
 		instanceTypes[np.Name] = launchbackoff.FilterUnavailable(ctx, its, p.launchBackoff)
 	}
-	daemonSetPods, err := p.getDaemonSetPods(ctx)
+	daemonSetPods, daemonSetPodsByDaemonSet, err := p.getDaemonSetPods(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting daemon pods, %w", err)
 	}
 	return &SchedulerCatalog{
-		nodePools:     nodePools,
-		instanceTypes: instanceTypes,
-		daemonSetPods: daemonSetPods,
+		nodePools:                nodePools,
+		instanceTypes:            instanceTypes,
+		daemonSetPods:            daemonSetPods,
+		daemonSetPodsByDaemonSet: daemonSetPodsByDaemonSet,
 	}, nil
 }
 
@@ -812,13 +823,15 @@ func instanceTypeList(names []string) string {
 	return itSb.String()
 }
 
-func (p *Provisioner) getDaemonSetPods(ctx context.Context) ([]*corev1.Pod, error) {
+// getDaemonSetPods returns one representative pod per DaemonSet, both in list order and indexed by DaemonSet.
+func (p *Provisioner) getDaemonSetPods(ctx context.Context) ([]*corev1.Pod, map[types.NamespacedName]*corev1.Pod, error) {
 	daemonSetList := &appsv1.DaemonSetList{}
 	if err := p.kubeClient.List(ctx, daemonSetList); err != nil {
-		return nil, fmt.Errorf("listing daemonsets, %w", err)
+		return nil, nil, fmt.Errorf("listing daemonsets, %w", err)
 	}
 
-	return lo.Map(daemonSetList.Items, func(d appsv1.DaemonSet, _ int) *corev1.Pod {
+	byDaemonSet := make(map[types.NamespacedName]*corev1.Pod, len(daemonSetList.Items))
+	pods := lo.Map(daemonSetList.Items, func(d appsv1.DaemonSet, _ int) *corev1.Pod {
 		pod := p.cluster.GetDaemonSetPod(&d)
 		if pod == nil {
 			pod = daemonset.PodForDaemonSet(&d)
@@ -835,8 +848,10 @@ func (p *Provisioner) getDaemonSetPods(ctx context.Context) ([]*corev1.Pod, erro
 			}
 			pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = d.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
 		}
+		byDaemonSet[client.ObjectKeyFromObject(&d)] = pod
 		return pod
-	}), nil
+	})
+	return pods, byDaemonSet, nil
 }
 
 func (p *Provisioner) Validate(ctx context.Context, pod *corev1.Pod) error {

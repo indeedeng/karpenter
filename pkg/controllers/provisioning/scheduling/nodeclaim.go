@@ -47,6 +47,7 @@ type NodeClaim struct {
 	reservationManager   *ReservationManager
 	topology             *Topology
 	daemonOverheadGroups []DaemonOverheadGroup
+	expectedDaemonPods   *expectedDaemonPods
 	hostname             string
 
 	// We store the reserved offerings rather than appending reservation ID labels for two reasons:
@@ -86,6 +87,7 @@ func NewNodeClaim(
 	nodeClaimTemplate *NodeClaimTemplate,
 	topology *Topology,
 	daemonOverheadGroups []DaemonOverheadGroup,
+	expectedDaemonPods *expectedDaemonPods,
 	instanceTypes []*cloudprovider.InstanceType,
 	reservationManager *ReservationManager,
 	reservedOfferingMode ReservedOfferingMode,
@@ -105,6 +107,7 @@ func NewNodeClaim(
 			InstanceTypes:  g.InstanceTypes,
 			DaemonOverhead: g.DaemonOverhead,
 			HostPortUsage:  g.HostPortUsage.DeepCopy(),
+			Pods:           g.Pods,
 		}
 	}
 
@@ -112,6 +115,7 @@ func NewNodeClaim(
 		NodeClaimTemplate:    template,
 		topology:             topology,
 		daemonOverheadGroups: groupsForNodeClaim,
+		expectedDaemonPods:   expectedDaemonPods,
 		hostname:             hostname,
 		reservedOfferings:    cloudprovider.Offerings{},
 		reservationManager:   reservationManager,
@@ -199,7 +203,7 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 	// affinity.
 	// NOTE: Topology requirements should come last since they can result in a single domain from a set of compatible
 	// domains. This can result in unnecessary failures from subsequent checks that narrow requirements.
-	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
+	topologyRequirements, topologyInstanceTypes, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, n.expectedDaemonPods, scheduling.AllowUndefinedWellKnownLabels)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -208,10 +212,18 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 	}
 	nodeClaimRequirements.Add(topologyRequirements.Values()...)
 
+	instanceTypes := n.InstanceTypeOptions
+	if topologyInstanceTypes != nil {
+		instanceTypes = lo.Filter(instanceTypes, func(it *cloudprovider.InstanceType, _ int) bool { return topologyInstanceTypes.Has(it.Name) })
+		if len(instanceTypes) == 0 {
+			return nil, nil, nil, nil, fmt.Errorf("no instance type satisfies pod affinity or anti-affinity to the DaemonSet pods expected on the node")
+		}
+	}
+
 	// Check instance type combinations
 	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
 
-	remaining, unsatisfiableKeys, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, pod, podData.Requests, n.daemonOverheadGroups, requests, relaxMinValues)
+	remaining, unsatisfiableKeys, err := filterInstanceTypesByRequirements(instanceTypes, nodeClaimRequirements, pod, podData.Requests, n.daemonOverheadGroups, requests, relaxMinValues)
 	if relaxMinValues {
 		// Update min values on the requirements if they are relaxed
 		for key, minValues := range unsatisfiableKeys {
